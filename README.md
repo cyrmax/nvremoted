@@ -116,18 +116,49 @@ To use:
     and signed certificates can be gotten from [Let's Encrypt][].
 * Run `nvremoted start`
 
-#### Building
-Install [Mage][], then use
+#### Development and builds
 
-    mage build
+This repository is the independently maintained `cyrmax/nvremoted` fork.
+Use Go 1.23 or newer; CI's pinned stable toolchain is in `.go-version`.
+Install [Mage][] at the version pinned in `go.mod`:
 
-to build, or
+```sh
+go install github.com/magefile/mage@v1.17.2
+```
 
-    mage install
+Mage is the shared local/CI development contract:
 
-to install.
+| Command | Purpose |
+| --- | --- |
+| `mage build` (or `mage`) | Build for the current host OS and architecture |
+| `mage test` | Run application and Mage contract tests 100 times |
+| `mage testRace` | Run the same tests 100 times with the race detector |
+| `mage check` | Check Go formatting, module tidiness and `go vet`, without edits |
+| `mage buildAll` | Build the full six-platform distribution matrix |
+| `mage clean` | Remove generated `dist` and legacy `bin` output |
 
-`GOOS` and `GOARCH` work as you'd expect.
+Platform targets are `mage buildLinuxAmd64`, `mage buildLinuxArm64`,
+`mage buildWindowsAmd64`, `mage buildWindowsArm64`, `mage buildDarwinAmd64`
+and `mage buildDarwinArm64`. Output is
+`dist/<linux|windows|darwin>-<amd64|arm64>/nvremoted`, with `.exe` for Windows
+and a sibling `.sha256` checksum. Builds preserve Git-derived version embedding.
+Host builds always select the host, even if `GOOS`/`GOARCH` are set externally.
+
+Builds and ordinary tests disable CGO; race tests enable it. Supply any
+machine-specific compiler environment outside Mage. The separate
+[Windows race setup](docs/build-ci.md#windows-race-environment) explains LLVM and
+the `PATH`/`Path` normalization caveat. For a short diagnostic run, set
+`NVREMOTED_TEST_COUNT=1`; the default remains 100 for both test targets.
+Fix formatting and module drift with standard `gofmt` and `go mod tidy` commands.
+
+CI invokes these same Mage targets. Download platform artifacts from a
+[successful GitHub Actions CI run](https://github.com/cyrmax/nvremoted/actions/workflows/ci.yml).
+Build/upload jobs require successful check, test and race jobs. Artifacts contain
+the binary and its SHA-256 checksum and are retained for 21 days. Choose a run
+whose overall status is **success**, so all six builds and uploads have completed.
+After extracting a Unix artifact, set its executable bit (`chmod +x nvremoted`);
+GitHub's ZIP artifact format does not preserve that permission.
+See [build and CI design](docs/build-ci.md) for the contract and verification details.
 
 [NVDA Remote]: https://www.nvdaremote.com
 [Let's Encrypt]: https://letsencrypt.org

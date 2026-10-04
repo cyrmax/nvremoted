@@ -121,6 +121,9 @@ func TestShutdownIdleAndTLSClients(t *testing.T) {
 					if err := json.NewDecoder(client).Decode(&motd); err != nil || motd.MOTD != srv.MOTD {
 						t.Fatalf("TLS protocol: %#v, %v", motd, err)
 					}
+					// Decoding does not prove send has reset its deadline. Wait
+					// for that reset before shutdown closes the TLS transport.
+					awaitLivenessSignal(t, conn.writeCleared)
 				}
 			} else {
 				l.steps <- acceptStep{conn: accepted}

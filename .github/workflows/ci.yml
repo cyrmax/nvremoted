@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+      - run: mage check
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+      - run: mage test
+
+  race:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+      # Ubuntu's standard GCC environment is sufficient; Mage owns CGO policy.
+      - run: mage testRace
+
+  build:
+    needs: [check, test, race]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            target: buildLinuxAmd64
+          - platform: linux-arm64
+            target: buildLinuxArm64
+          - platform: windows-amd64
+            target: buildWindowsAmd64
+          - platform: windows-arm64
+            target: buildWindowsArm64
+          - platform: darwin-amd64
+            target: buildDarwinAmd64
+          - platform: darwin-arm64
+            target: buildDarwinArm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Preserve the tag history used by Mage's git describe version.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+      - name: Build distribution
+        env:
+          MAGE_TARGET: ${{ matrix.target }}
+        run: mage "$MAGE_TARGET"
+      - name: Upload verified distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvremoted-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}/
+          if-no-files-found: error
+          retention-days: 21

@@ -4,7 +4,7 @@ go 1.23.0
 
 require (
 	github.com/howeyc/gopass v0.0.0-20210920133722-c8aef6fb66ef
-	github.com/magefile/mage v1.14.0
+	github.com/magefile/mage v1.17.2
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
