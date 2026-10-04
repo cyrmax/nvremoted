@@ -370,16 +370,16 @@ func TestServeConcurrentTCPAndTLSAdmission(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			l.Close()
-			if err := receiveAcceptResult(t, result); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("Serve: %v", err)
-			}
-			// Already accepted clients must still complete protocol I/O and cleanup.
+			// Complete the admitted sessions before ending the serving lifecycle.
 			close(continueClients)
 			for i := 0; i < count; i++ {
 				if err := receiveAcceptResult(t, finished); err != nil {
 					t.Fatal(err)
 				}
+			}
+			l.Close()
+			if err := receiveAcceptResult(t, result); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("Serve: %v", err)
 			}
 			seen := make(map[uint64]bool)
 			for len(seen) < count {

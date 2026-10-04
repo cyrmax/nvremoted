@@ -6,7 +6,9 @@
 package server
 
 import (
+	"context"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -15,7 +17,8 @@ import (
 	"crypto/tls"
 )
 
-// Server Contains state for an NVRemoted server.
+// Server contains state for one NVRemoted server run. Configure it before use;
+// it must not be copied or served again, even after the first run has ended.
 type Server struct {
 	// EventQueueSize bounds pending events per client (in addition to the event
 	// being handled). Nonpositive values use 64, allowing short bursts without
@@ -56,10 +59,27 @@ type Server struct {
 
 	// registry stores information about clients and channels on the server.
 	registry registry
+
+	lifecycleMu sync.Mutex
+	started     bool
+	stopping    bool
+	stop        chan struct{}
+	done        chan struct{}
+	active      map[*client]struct{}
+	clients     sync.WaitGroup
+	shutdownErr error
 }
+
+// ErrServerUsed means a serving method was called on an already used or
+// shut down Server. Create another Server for a restart.
+var ErrServerUsed = errors.New("Server has already been used or shut down")
 
 // ListenAndServe listens for connections on the network, and connects them to the NVDA Remote server.
 func (srv *Server) ListenAndServe(addr string) error {
+	if err := srv.beginRun(); err != nil {
+		return err
+	}
+	defer srv.finishRun()
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return errors.Wrap(err, "Listen")
@@ -70,11 +90,15 @@ func (srv *Server) ListenAndServe(addr string) error {
 		"addr":        addr,
 		"tls_enabled": false,
 	}).Info("Listening for incoming connections")
-	return srv.Serve(listener)
+	return srv.serve(listener)
 }
 
 // ListenAndServeTLS behaves just like ListenAndServe, but wraps the connection with TLS.
 func (srv *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
+	if err := srv.beginRun(); err != nil {
+		return err
+	}
+	defer srv.finishRun()
 	if certFile != "" && keyFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
@@ -96,11 +120,18 @@ func (srv *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
 		"addr":        addr,
 		"tls_enabled": true,
 	}).Info("Listening for incoming connections")
-	return srv.Serve(listener)
+	return srv.serve(listener)
 }
 
 func (srv *Server) acceptClients(listener net.Listener) error {
-	return srv.acceptClientsWithRetry(listener, time.Sleep)
+	return srv.acceptClientsWithRetry(listener, func(delay time.Duration) {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-srv.stop:
+		}
+	})
 }
 
 // acceptClientsWithRetry keeps the retry wait injectable for deterministic tests.
@@ -110,6 +141,9 @@ func (srv *Server) acceptClientsWithRetry(listener net.Listener, wait func(time.
 	var nextID uint64
 	var retryDelay time.Duration
 	for {
+		if srv.isStopping() {
+			return net.ErrClosed
+		}
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -154,47 +188,161 @@ func (srv *Server) acceptClientsWithRetry(listener net.Listener, wait func(time.
 	}
 }
 
-// Serve serves incoming connections until a terminal accept error. Known
-// resource shortages are retried with a capped delay; other errors stop serving.
-// The returned error wraps the accept error, including net.ErrClosed on closure.
-// The caller owns the listener. Returning stops periodic pings but does not
-// close or wait for already accepted clients; their lifecycles remain independent.
-// Do not call Serve again on this Server while those clients remain active.
+// Serve runs the server once. An accept failure stops all accepted sessions and
+// waits for their cleanup before returning the wrapped accept error.
+// The caller owns listener: Serve does not close it on an accept failure.
+// An explicit Shutdown closes it to unblock Accept; Serve then returns nil.
+// All serving methods share the single-run restriction, including failed starts.
 func (srv *Server) Serve(listener net.Listener) error {
+	if err := srv.beginRun(); err != nil {
+		return err
+	}
+	defer srv.finishRun()
+	return srv.serve(listener)
+}
+
+func (srv *Server) beginRun() error {
+	srv.lifecycleMu.Lock()
+	defer srv.lifecycleMu.Unlock()
+	if srv.started || srv.stopping {
+		return ErrServerUsed
+	}
+	srv.started = true
+	srv.stop = make(chan struct{})
+	srv.done = make(chan struct{})
+	srv.active = make(map[*client]struct{})
+	now := time.Now()
+	srv.registry.lock.Lock()
+	srv.registry.clients = make(map[uint64]channelMember)
+	srv.registry.channels = make(map[string]*channel)
+	srv.registry.statsPassword = srv.StatsPassword
+	srv.registry.createdTime = now
+	srv.registry.maxChannelsTime = now
+	srv.registry.maxClientsTime = now
+	srv.registry.lock.Unlock()
+	return nil
+}
+
+func (srv *Server) isStopping() bool {
+	srv.lifecycleMu.Lock()
+	defer srv.lifecycleMu.Unlock()
+	return srv.stopping
+}
+
+func (srv *Server) stopRun() {
+	srv.lifecycleMu.Lock()
+	defer srv.lifecycleMu.Unlock()
+	if !srv.stopping {
+		srv.stopping = true
+		close(srv.stop)
+	}
+}
+
+// Shutdown stops admission and periodic pings, closes the serving listener and
+// every accepted transport (including idle clients and TLS handshakes), and
+// waits for accept, client, and channel cleanup and disconnect logging.
+// It does not wait for peers to voluntarily leave or flush queued messages.
+// The context bounds only this caller's wait. On cancellation it returns
+// ctx.Err(); teardown continues, and a later Shutdown can wait for completion.
+// Successful calls are idempotent. Before serving, it permanently shuts down
+// the unused Server. Listener close errors are returned after cleanup; client
+// close errors retain their existing diagnostic behavior and are not aggregated.
+// Custom transports and logging hooks must allow teardown to finish.
+func (srv *Server) Shutdown(ctx context.Context) error {
+	srv.lifecycleMu.Lock()
+	if srv.done == nil {
+		srv.stop = make(chan struct{})
+		srv.done = make(chan struct{})
+		srv.stopping = true
+		close(srv.stop)
+		close(srv.done)
+	} else if !srv.stopping {
+		srv.stopping = true
+		close(srv.stop)
+	}
+	done := srv.done
+	srv.lifecycleMu.Unlock()
+	// Prefer the completed result even with an already canceled context.
+	select {
+	case <-done:
+		return srv.shutdownErr
+	default:
+	}
+	select {
+	case <-done:
+		return srv.shutdownErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (srv *Server) finishRun() {
+	srv.stopRun()
+	// Accept has ended before this point, and stopping prevents new admissions.
+	srv.lifecycleMu.Lock()
+	active := make([]*client, 0, len(srv.active))
+	for c := range srv.active {
+		active = append(active, c)
+	}
+	srv.lifecycleMu.Unlock()
+	// Close independently: a slow/custom transport must not delay closing peers.
+	var stops sync.WaitGroup
+	for _, c := range active {
+		stops.Add(1)
+		go func(c *client) {
+			defer stops.Done()
+			c.stop("Server shutdown")
+		}(c)
+	}
+	stops.Wait()
+	srv.clients.Wait()
+	// Client cleanup acknowledges channel removal before channel.start returns.
+	srv.registry.workers.Wait()
+	close(srv.done)
+}
+
+func (srv *Server) serve(listener net.Listener) error {
 	srv.Log.WithFields(logrus.Fields{
 		"time_between_pings":  srv.TimeBetweenPings,
 		"pings_until_timeout": srv.PingsUntilTimeout,
 	}).Info("Server started")
-
-	now := time.Now()
-	srv.registry = registry{
-		clients:         make(map[uint64]channelMember),
-		channels:        make(map[string]*channel),
-		statsPassword:   srv.StatsPassword,
-		createdTime:     now,
-		maxChannelsTime: now,
-		maxClientsTime:  now,
-	}
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- srv.acceptClients(listener) }()
 
-	// Setup a ping timer to periodically ping clients.
-	// If timeBetweenPings is 0,
-	// pingsCH will remain nil, and clients will not be pinged.
 	var pingsCH <-chan time.Time
 	if srv.TimeBetweenPings > 0 {
 		ticker := time.NewTicker(srv.TimeBetweenPings)
 		defer ticker.Stop()
 		pingsCH = ticker.C
 	}
-
 	for {
 		select {
 		case err := <-acceptDone:
+			if srv.isStopping() {
+				srv.closeListener(listener)
+				if errors.Is(err, net.ErrClosed) {
+					return nil
+				}
+			}
 			return err
+		case <-srv.stop:
+			srv.closeListener(listener)
+			err := <-acceptDone
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			return nil
 		case <-pingsCH:
-			srv.dispatchPings()
+			if !srv.isStopping() {
+				srv.dispatchPings()
+			}
 		}
+	}
+}
+
+func (srv *Server) closeListener(listener net.Listener) {
+	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		srv.shutdownErr = errors.Wrap(err, "Close listener")
 	}
 }
 
@@ -214,6 +362,9 @@ func (srv *Server) dispatchPings() {
 	}
 	srv.registry.lock.RUnlock()
 	for _, member := range members {
+		if srv.isStopping() {
+			return
+		}
 		member.enqueue(pingMessage{})
 	}
 }

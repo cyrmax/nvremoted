@@ -52,6 +52,19 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 		writeTimeout: srv.WriteTimeout,
 	}
 
+	srv.lifecycleMu.Lock()
+	if srv.stopping {
+		srv.lifecycleMu.Unlock()
+		c.stop("Server shutdown")
+		return
+	}
+	if srv.active == nil {
+		srv.active = make(map[*client]struct{})
+	}
+	srv.active[c] = struct{}{}
+	srv.clients.Add(1)
+	srv.lifecycleMu.Unlock()
+
 	// Wait for both goroutines before removing channel and registry state.
 	finished := make(chan struct{}, 2)
 
@@ -62,12 +75,21 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 
 	go func() {
 		defer func() {
+			srv.lifecycleMu.Lock()
+			delete(srv.active, c)
+			srv.lifecycleMu.Unlock()
+			srv.clients.Done()
+		}()
+		defer func() {
 			c.leaveChannel()
 			conn.Close()
+			c.stopMTX.RLock()
+			reason := c.stopReason
+			c.stopMTX.RUnlock()
 			srv.Log.WithFields(logrus.Fields{
 				"id":          id,
 				"remote_host": remoteHost,
-				"reason":      c.stopReason,
+				"reason":      reason,
 			}).Info("Client disconnected")
 		}()
 

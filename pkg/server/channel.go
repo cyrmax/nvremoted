@@ -71,7 +71,11 @@ func joinChannel(name string, member channelMember, reg *registry) (*channel, []
 			parts:    make(chan leaveChannelRequest),
 		}
 		reg.channels[name] = c
-		go c.start(reg)
+		reg.workers.Add(1)
+		go func() {
+			defer reg.workers.Done()
+			c.start(reg)
+		}()
 
 		if c.isE2e() {
 			reg.numE2eChannels++

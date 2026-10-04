@@ -10,7 +10,8 @@ import (
 )
 
 type registry struct {
-	lock            sync.RWMutex // Protects the entire registry
+	lock            sync.RWMutex   // Protects the entire registry
+	workers         sync.WaitGroup // Channel goroutines; wait after all clients finish.
 	clients         map[uint64]channelMember
 	channels        map[string]*channel
 	statsPassword   string
