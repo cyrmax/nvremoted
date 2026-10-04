@@ -56,7 +56,13 @@ func TestAdmissionDoesNotResolveDNS(t *testing.T) {
 			for i := range peers {
 				conn, peer := handshakePipe(t)
 				peers[i] = peer
-				l.incoming <- &admissionConn{handshakeConn: conn, addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.123"), Port: 4567}}
+				select {
+				case l.incoming <- &admissionConn{handshakeConn: conn, addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.123"), Port: 4567}}:
+				case <-started:
+					t.Fatal("reverse DNS blocked accepting the next connection")
+				case <-time.After(2 * time.Second):
+					t.Fatal("accept did not advance to the next connection")
+				}
 				select {
 				case <-conn.reads:
 				case <-started:
@@ -99,6 +105,54 @@ func TestAdmissionDoesNotResolveDNS(t *testing.T) {
 				t.Fatalf("admission performed %d DNS calls", calls.Load())
 			}
 			assertLifecycleRegistryEmpty(t, &srv.registry)
+		})
+	}
+}
+
+func TestAdmissionPeerAddressLogs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr net.Addr
+		want string
+	}{
+		{"ipv4", &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1234}, "192.0.2.1"},
+		{"ipv6", &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 1234}, "2001:db8::1"},
+		{"ipv6_zone", &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 1234, Zone: "test"}, "fe80::1%test"},
+		{"non_tcp", &net.UnixAddr{Name: "test-peer", Net: "unix"}, "test-peer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, log := handshakeServer(t)
+			l := &handshakeListener{incoming: make(chan net.Conn), stop: make(chan struct{})}
+			done := make(chan struct{})
+			go func() { defer close(done); srv.acceptClients(l) }()
+			t.Cleanup(func() { l.Close(); awaitLivenessSignal(t, done) })
+			conn, peer := handshakePipe(t)
+			l.incoming <- &admissionConn{handshakeConn: conn, addr: tc.addr}
+			awaitLivenessSignal(t, conn.reads)
+			peer.Close()
+			connected := false
+			for {
+				select {
+				case e := <-log.entries:
+					if e.Message != "Client connected" && e.Message != "Client disconnected" {
+						continue
+					}
+					if e.Data["remote_host"] != tc.want {
+						t.Fatalf("remote_host: %v, want %q", e.Data, tc.want)
+					}
+					if e.Message == "Client connected" {
+						connected = true
+					} else {
+						if !connected {
+							t.Fatal("missing connection log")
+						}
+						assertLifecycleRegistryEmpty(t, &srv.registry)
+						return
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("client lifecycle did not finish")
+				}
+			}
 		})
 	}
 }

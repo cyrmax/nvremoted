@@ -37,6 +37,22 @@ Connection logs use the peer IP address in `remote_host`. Admission performs no
 reverse DNS queries, so slow or unavailable DNS cannot delay other clients or
 the start of the TLS handshake timeout.
 
+`Serve` returns an error when its listener's `Accept` fails; `ListenAndServe`
+and `ListenAndServeTLS` propagate that error and close their owned listener.
+Closure is detectable with `errors.Is(err, net.ErrClosed)` and is logged only
+at debug level. Known descriptor/buffer/memory exhaustion errors are retried
+with exponential delays from 5 milliseconds to 1 second, reset after a success.
+Only the first failure in each consecutive resource exhaustion series is logged
+as a warning. Closing the listener during a retry wait is observed on the next
+accept, after at most 1 second. Other accept failures, including listener
+timeouts, are logged once and returned. Retries do not use the deprecated
+`net.Error.Temporary` classification. Standard TCP listeners handle interrupted
+and aborted accepts internally. A caller of `Serve` owns its listener and must
+close it when done. Returning stops periodic pings but does not close or wait
+for accepted sessions; this is not a graceful server shutdown API.
+Do not reuse the same `Server` for another `Serve` call while its clients are
+still active.
+
 To use:
 
 * `go install github.com/n0ot/nvremoted/cmd/nvremoted`

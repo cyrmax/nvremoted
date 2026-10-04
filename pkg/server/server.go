@@ -70,8 +70,7 @@ func (srv *Server) ListenAndServe(addr string) error {
 		"addr":        addr,
 		"tls_enabled": false,
 	}).Info("Listening for incoming connections")
-	srv.Serve(listener)
-	return nil
+	return srv.Serve(listener)
 }
 
 // ListenAndServeTLS behaves just like ListenAndServe, but wraps the connection with TLS.
@@ -97,19 +96,48 @@ func (srv *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
 		"addr":        addr,
 		"tls_enabled": true,
 	}).Info("Listening for incoming connections")
-	srv.Serve(listener)
-	return nil
+	return srv.Serve(listener)
 }
 
-func (srv *Server) acceptClients(listener net.Listener) {
+func (srv *Server) acceptClients(listener net.Listener) error {
+	return srv.acceptClientsWithRetry(listener, time.Sleep)
+}
+
+// acceptClientsWithRetry keeps the retry wait injectable for deterministic tests.
+// No extra goroutine or timer survives an accept retry. Closing a listener during
+// the wait is observed by the next Accept, after at most one second.
+func (srv *Server) acceptClientsWithRetry(listener net.Listener, wait func(time.Duration)) error {
 	var nextID uint64
+	var retryDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			srv.Log.WithFields(logrus.Fields{
-				"error": err,
-			}).Error("Error accepting connection")
-			continue
+			if errors.Is(err, net.ErrClosed) {
+				srv.Log.Debug("Listener closed")
+				return errors.Wrap(err, "Accept")
+			}
+			// Retry only known resource shortages, not the deprecated and
+			// ambiguous net.Error.Temporary classification. TCP listeners
+			// already handle interrupted/aborted connections internally.
+			if isAcceptResourceError(err) {
+				if retryDelay == 0 {
+					srv.Log.WithError(err).Warn("Accept resource exhaustion; retrying")
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+					if retryDelay > time.Second {
+						retryDelay = time.Second
+					}
+				}
+				wait(retryDelay)
+				continue
+			}
+			srv.Log.WithError(err).Error("Error accepting connection")
+			return errors.Wrap(err, "Accept")
+		}
+		if retryDelay != 0 {
+			srv.Log.Debug("Accept resumed after resource exhaustion")
+			retryDelay = 0
 		}
 		if err := configureTCPKeepAlive(conn); err != nil {
 			srv.Log.WithError(err).Warn("Error configuring TCP keepalive")
@@ -126,8 +154,13 @@ func (srv *Server) acceptClients(listener net.Listener) {
 	}
 }
 
-// Serve serves clients the NVDA Remote service.
-func (srv *Server) Serve(listener net.Listener) {
+// Serve serves incoming connections until a terminal accept error. Known
+// resource shortages are retried with a capped delay; other errors stop serving.
+// The returned error wraps the accept error, including net.ErrClosed on closure.
+// The caller owns the listener. Returning stops periodic pings but does not
+// close or wait for already accepted clients; their lifecycles remain independent.
+// Do not call Serve again on this Server while those clients remain active.
+func (srv *Server) Serve(listener net.Listener) error {
 	srv.Log.WithFields(logrus.Fields{
 		"time_between_pings":  srv.TimeBetweenPings,
 		"pings_until_timeout": srv.PingsUntilTimeout,
@@ -142,7 +175,8 @@ func (srv *Server) Serve(listener net.Listener) {
 		maxChannelsTime: now,
 		maxClientsTime:  now,
 	}
-	go srv.acceptClients(listener)
+	acceptDone := make(chan error, 1)
+	go func() { acceptDone <- srv.acceptClients(listener) }()
 
 	// Setup a ping timer to periodically ping clients.
 	// If timeBetweenPings is 0,
@@ -156,6 +190,8 @@ func (srv *Server) Serve(listener net.Listener) {
 
 	for {
 		select {
+		case err := <-acceptDone:
+			return err
 		case <-pingsCH:
 			srv.dispatchPings()
 		}
