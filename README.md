@@ -33,6 +33,10 @@ can independently override the handshake timeout; nonpositive values use
 10 seconds. It applies only to TLS connections, including a TLS listener passed
 to `Serve`, and does not affect plain TCP connections.
 
+Connection logs use the peer IP address in `remote_host`. Admission performs no
+reverse DNS queries, so slow or unavailable DNS cannot delay other clients or
+the start of the TLS handshake timeout.
+
 To use:
 
 * `go install github.com/n0ot/nvremoted/cmd/nvremoted`

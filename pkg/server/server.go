@@ -6,9 +6,7 @@
 package server
 
 import (
-	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -117,8 +115,12 @@ func (srv *Server) acceptClients(listener net.Listener) {
 			srv.Log.WithError(err).Warn("Error configuring TCP keepalive")
 		}
 
-		remoteAddr, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		remoteHost := getHostFromAddrIfPossible(remoteAddr)
+		// Peer identity is diagnostic only. Keep DNS work out of admission and
+		// retain the address even for listeners without host:port addresses.
+		remoteHost := conn.RemoteAddr().String()
+		if host, _, err := net.SplitHostPort(remoteHost); err == nil {
+			remoteHost = host
+		}
 		srv.serveClient(conn, nextID, remoteHost)
 		nextID++
 	}
@@ -184,20 +186,4 @@ type pingMessage struct{}
 
 func (pingMessage) Name() string {
 	return "ping"
-}
-
-// getHostFromAddrIfPossible tries to get the reverse dns host for an address.
-// If that isn't possible, it just returns the address.
-func getHostFromAddrIfPossible(addr string) string {
-	var hosts string
-	names, err := net.LookupAddr(addr)
-	if err == nil { // No need to report errors; just fallback to IP
-		hosts = strings.Join(names, ", ")
-	}
-
-	if hosts == "" {
-		return addr
-	}
-
-	return fmt.Sprintf("%s (%s)", hosts, addr)
 }
