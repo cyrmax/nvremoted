@@ -139,7 +139,8 @@ func (c *channel) start(reg *registry) {
 			if !exists {
 				// Send current members to the joiner
 				// and notify existing members.
-				req.resp <- c.members
+				// The caller converts this snapshot while membership can change.
+				req.resp <- append([]channelMember(nil), c.members...)
 				c.broadcast(joinedChannelMSG(req.member))
 				c.members = append(c.members, req.member)
 			} else {
@@ -152,8 +153,13 @@ func (c *channel) start(reg *registry) {
 		case req := <-c.parts:
 			for i, member := range c.members {
 				if req.id == member.id {
-					c.members = append(c.members[:i], c.members[i+1:]...)
+					copy(c.members[i:], c.members[i+1:])
+					// stop is a method value holding the departed *client. Clear
+					// the unused slot so a live channel cannot retain that client.
+					c.members[len(c.members)-1] = channelMember{}
+					c.members = c.members[:len(c.members)-1]
 					c.broadcast(leftChannelMSG(member))
+					break
 				}
 			}
 			reg.lock.Lock()

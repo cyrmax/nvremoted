@@ -79,8 +79,9 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 
 // leaveChannel runs after both client goroutines have finished. Keep receiving
 // events until membership cleanup completes. The queue is never closed, so even
-// a registry snapshot retained across cleanup can enqueue safely;
-// handleClient terminates via recv, and retained member references do not own it.
+// a registry snapshot retained across cleanup can enqueue safely.
+// handleClient terminates via recv. Retained members hold the client through
+// their stop callback until the snapshot or notification is released.
 func (c *client) leaveChannel() {
 	if c.channel == nil {
 		return

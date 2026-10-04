@@ -27,7 +27,8 @@ type Server struct {
 
 	// WriteTimeout bounds each response write, independently of pings and TCP
 	// keepalive. Nonpositive values use 10 seconds, tolerating transient network
-	// stalls while bounding cleanup even when there are no more events.
+	// stalls even when there are no more events. This is a socket write deadline,
+	// not a timeout for TLS handshake reads or the entire send operation.
 	WriteTimeout time.Duration
 
 	// TimeBetweenPings specifies the amount of time that will elapse before clients will be sent a ping.
