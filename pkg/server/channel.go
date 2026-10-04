@@ -32,6 +32,19 @@ type channelMember struct {
 	id             uint64
 	connectionType string
 	events         chan<- Message
+	stop           func(string)
+}
+
+// enqueue preserves FIFO delivery while the client can keep up. Once the
+// bounded queue is full, terminate the connection rather than silently omit a
+// protocol message and leave the peer running with incomplete protocol state.
+// Called without registry or pendingJoins locks; stop may close network I/O.
+func (member channelMember) enqueue(msg Message) {
+	select {
+	case member.events <- msg:
+	default:
+		member.stop("Client event queue overflow")
+	}
 }
 
 type joinChannelRequest struct {
@@ -157,8 +170,7 @@ func (c *channel) start(reg *registry) {
 			c.pendingJoinsLock.Unlock()
 			reg.lock.Unlock()
 
-			// Acknowledge only after all membership and registry cleanup. Taking
-			// the write lock also waits for any in-flight periodic dispatch.
+			// Acknowledge only after all membership and registry cleanup.
 			req.resp <- struct{}{}
 			if empty {
 				return
@@ -167,7 +179,7 @@ func (c *channel) start(reg *registry) {
 		case msg := <-c.messages:
 			for _, member := range c.members {
 				if msg.origin != member.id {
-					member.events <- msg
+					member.enqueue(msg)
 				}
 			}
 
@@ -177,7 +189,7 @@ func (c *channel) start(reg *registry) {
 
 func (c *channel) broadcast(msg Message) {
 	for _, member := range c.members {
-		member.events <- msg
+		member.enqueue(msg)
 	}
 }
 

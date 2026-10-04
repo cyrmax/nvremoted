@@ -5,41 +5,50 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
 // client represents a client on the server.
 type client struct {
-	id         uint64
-	conn       net.Conn
-	events     chan Message  // passes internal messages to a client
-	recv       chan Message  // passes messages to a client from the network
-	readNext   chan struct{} // Used by handleClient to ask readFromClient to read the next message
-	channel    *channel      // active channel
-	registry   *registry
-	encoder    *json.Encoder
-	stopMTX    sync.RWMutex // Protects stopped and stopReason
-	stopped    bool
-	stopReason string
-	log        *logrus.Logger
+	id           uint64
+	conn         net.Conn
+	events       chan Message  // passes internal messages to a client
+	recv         chan Message  // passes messages to a client from the network
+	readNext     chan struct{} // Used by handleClient to ask readFromClient to read the next message
+	channel      *channel      // active channel
+	registry     *registry
+	encoder      *json.Encoder
+	sendMTX      sync.Mutex // Serializes the encoder and each write's deadline.
+	writeTimeout time.Duration
+	stopMTX      sync.RWMutex // Protects stopped and stopReason
+	stopped      bool
+	stopReason   string
+	log          *logrus.Logger
 }
 
 // serveClient handles events sent and received by a client.
 func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
+	queueSize := srv.EventQueueSize
+	if queueSize <= 0 {
+		queueSize = defaultEventQueueSize
+	}
 	c := &client{
-		id:       id,
-		conn:     conn,
-		events:   make(chan Message, 1),
-		recv:     make(chan Message),
-		readNext: make(chan struct{}),
-		registry: &srv.registry,
-		encoder:  json.NewEncoder(conn),
-		log:      srv.Log,
+		id:           id,
+		conn:         conn,
+		events:       make(chan Message, queueSize),
+		recv:         make(chan Message),
+		readNext:     make(chan struct{}),
+		registry:     &srv.registry,
+		encoder:      json.NewEncoder(conn),
+		log:          srv.Log,
+		writeTimeout: srv.WriteTimeout,
 	}
 
 	// Wait for both goroutines before removing channel and registry state.
@@ -69,8 +78,8 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 }
 
 // leaveChannel runs after both client goroutines have finished. Keep receiving
-// events until channel delivery and registry dispatch can no longer target us:
-// either sender may already be blocked on this queue. The queue is never closed;
+// events until membership cleanup completes. The queue is never closed, so even
+// a registry snapshot retained across cleanup can enqueue safely;
 // handleClient terminates via recv, and retained member references do not own it.
 func (c *client) leaveChannel() {
 	if c.channel == nil {
@@ -197,6 +206,10 @@ func (c *client) stop(reason string) {
 	c.stopMTX.Unlock()
 
 	// Wake blocked reads and writes so cleanup does not need an idle timeout.
+	// A backpressure disconnect must not wait for TLS close_notify delivery.
+	if conn, ok := c.conn.(*tls.Conn); ok {
+		conn.NetConn().Close()
+	}
 	c.conn.Close()
 }
 
@@ -211,11 +224,30 @@ func (c *client) isStopped() bool {
 }
 
 func (c *client) send(resp Message) {
-	if err := c.encoder.Encode(resp); err != nil {
+	c.sendMTX.Lock()
+	defer c.sendMTX.Unlock()
+	if c.isStopped() {
+		return
+	}
+	timeout := c.writeTimeout
+	if timeout <= 0 {
+		timeout = defaultWriteTimeout
+	}
+	err := c.conn.SetWriteDeadline(time.Now().Add(timeout))
+	if err == nil {
+		err = c.encoder.Encode(resp)
+	}
+	if err == nil {
+		// Do not leave an expired deadline on an idle connection: TLS may also
+		// write control records while reading from the peer.
+		err = c.conn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
 		c.log.WithFields(logrus.Fields{
 			"id":    c.id,
 			"error": err,
-		}).Warn("Error while marshaling response to client")
+		}).Warn("Error sending response to client")
+		// In particular, a TLS write timeout makes further writes unsafe.
 		c.stop("Send error")
 	}
 }
