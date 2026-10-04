@@ -37,8 +37,9 @@ Connection logs use the peer IP address in `remote_host`. Admission performs no
 reverse DNS queries, so slow or unavailable DNS cannot delay other clients or
 the start of the TLS handshake timeout.
 
-`Serve` returns an error when its listener's `Accept` fails; `ListenAndServe`
-and `ListenAndServeTLS` propagate that error and close their owned listener.
+When admission ends outside explicit shutdown, `Serve` returns the accept
+error; `ListenAndServe` and `ListenAndServeTLS` propagate that error and close
+their owned listener.
 Closure is detectable with `errors.Is(err, net.ErrClosed)` and is logged only
 at debug level. Known descriptor/buffer/memory exhaustion errors are retried
 with exponential delays from 5 milliseconds to 1 second, reset after a success.
@@ -47,11 +48,36 @@ as a warning. Closing the listener during a retry wait is observed on the next
 accept, after at most 1 second. Other accept failures, including listener
 timeouts, are logged once and returned. Retries do not use the deprecated
 `net.Error.Temporary` classification. Standard TCP listeners handle interrupted
-and aborted accepts internally. A caller of `Serve` owns its listener and must
-close it when done. Returning stops periodic pings but does not close or wait
-for accepted sessions; this is not a graceful server shutdown API.
-Do not reuse the same `Server` for another `Serve` call while its clients are
-still active.
+and aborted accepts internally.
+
+`Server` is a single-run object: configure it before use and create another
+instance for a restart. A second or concurrent call to any serving method
+returns `server.ErrServerUsed`, including after a failed start. Calling
+`Shutdown` before serving also permanently closes the unused instance.
+
+`Shutdown(ctx)` stops admission and periodic pings, closes the listener and all
+accepted transports (including idle connections and unfinished TLS handshakes),
+and waits for client/channel cleanup and disconnect logs. It closes sessions
+immediately rather than waiting for peers to leave or flushing event queues.
+The context limits only the caller's wait: cancellation returns `ctx.Err()`
+while teardown continues. Call `Shutdown` again to wait for completion.
+Completed calls return the same listener-close error, or nil; client close
+errors retain their existing handling and are not aggregated. Custom transports
+and logging hooks must cooperate with teardown.
+
+`Serve` also closes and waits for all accepted sessions when acceptance ends,
+and stops its ping ticker before returning. Explicit shutdown returns nil;
+external listener closure returns a wrapped `net.ErrClosed`; terminal accept
+failures retain their wrapped error, even when racing with shutdown. In-flight
+ping snapshots check cancellation between recipients; a delivery already in
+progress can finish during shutdown, but none remains after completion.
+
+A caller of `Serve` owns its listener and must close it after an accept failure.
+`Serve` does not close it merely because `Accept` failed. Calling `Shutdown`
+explicitly authorizes closing the active listener to unblock `Accept`.
+`ListenAndServe` and `ListenAndServeTLS` close their internally created listener
+on every exit. See [the lifecycle design](docs/server-lifecycle.md) for ownership,
+synchronization, and error guarantees.
 
 To use:
 
