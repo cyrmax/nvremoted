@@ -31,6 +31,11 @@ type Server struct {
 	// not a timeout for TLS handshake reads or the entire send operation.
 	WriteTimeout time.Duration
 
+	// TLSHandshakeTimeout bounds TLS session establishment before protocol I/O.
+	// Nonpositive values use 10 seconds. It is independent of WriteTimeout,
+	// pings and TCP keepalive, and does not limit application idle time.
+	TLSHandshakeTimeout time.Duration
+
 	// TimeBetweenPings specifies the amount of time that will elapse before clients will be sent a ping.
 	// If 0, no pings will be sent.
 	TimeBetweenPings time.Duration
@@ -156,8 +161,9 @@ func (srv *Server) Serve(listener net.Listener) {
 }
 
 const (
-	defaultEventQueueSize = 64
-	defaultWriteTimeout   = 10 * time.Second
+	defaultEventQueueSize      = 64
+	defaultWriteTimeout        = 10 * time.Second
+	defaultTLSHandshakeTimeout = 10 * time.Second
 )
 
 // Snapshot under the registry lock, then deliver without holding it. Queues

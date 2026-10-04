@@ -19,12 +19,19 @@ dropping or coalescing messages on a continuing connection. Each response gets
 a 10-second socket write deadline; a timeout or write error stops the connection
 and prevents further protocol writes. These limits are independent of ping and
 TCP keepalive settings. The write deadline does not bound reads during an
-unfinished TLS handshake; there is currently no TLS handshake timeout.
+unfinished TLS handshake. TLS session establishment has its own 10-second
+timeout for the entire handshake, before any protocol reads or writes. Each
+handshake runs independently of the accept loop and other clients. A failed or
+timed out handshake closes the connection; a successful handshake cancels its
+timer without leaving a socket deadline or limiting application idle time.
 
 Go API users can set `server.Server.EventQueueSize` and
 `server.Server.WriteTimeout` before serving clients; nonpositive values use
 64 and 10 seconds, respectively. The CLI uses these defaults; there are no
-CLI flags or TOML keys for these limits.
+CLI flags or TOML keys for these limits. `server.Server.TLSHandshakeTimeout`
+can independently override the handshake timeout; nonpositive values use
+10 seconds. It applies only to TLS connections, including a TLS listener passed
+to `Serve`, and does not affect plain TCP connections.
 
 To use:
 

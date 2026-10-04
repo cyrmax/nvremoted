@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"io"
@@ -59,21 +60,48 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 		"remote_host": remoteHost,
 	}).Info("Client connected")
 
-	go srv.readFromClient(c, finished)
-	go srv.handleClient(c, finished)
 	go func() {
-		// Wait for both readFromClient and handleClient to finish
+		defer func() {
+			c.leaveChannel()
+			conn.Close()
+			srv.Log.WithFields(logrus.Fields{
+				"id":          id,
+				"remote_host": remoteHost,
+				"reason":      c.stopReason,
+			}).Info("Client disconnected")
+		}()
+
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			timeout := srv.TLSHandshakeTimeout
+			if timeout <= 0 {
+				timeout = defaultTLSHandshakeTimeout
+			}
+			// Keep handshake I/O out of the serial accept loop and ahead of
+			// protocol reads/writes. Context cancellation closes the transport
+			// during handshake; after success it cannot affect the connection.
+			// No socket deadline is installed, so idle clients remain valid.
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := tlsConn.HandshakeContext(ctx)
+			cancel()
+			if err != nil {
+				reason := "TLS handshake error"
+				if err == context.DeadlineExceeded {
+					reason = "TLS handshake timeout"
+				}
+				c.stop(reason)
+				srv.Log.WithFields(logrus.Fields{
+					"id":    id,
+					"error": err,
+				}).Debug("TLS handshake failed")
+				return
+			}
+		}
+
+		go srv.readFromClient(c, finished)
+		go srv.handleClient(c, finished)
+		// Wait for both readFromClient and handleClient to finish.
 		<-finished
 		<-finished
-
-		c.leaveChannel()
-
-		conn.Close()
-		srv.Log.WithFields(logrus.Fields{
-			"id":          id,
-			"remote_host": remoteHost,
-			"reason":      c.stopReason,
-		}).Info("Client disconnected")
 	}()
 }
 
