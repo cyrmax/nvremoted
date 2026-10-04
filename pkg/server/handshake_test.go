@@ -11,7 +11,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -245,9 +244,7 @@ func TestTLSHandshakeBlockedWriteTimeout(t *testing.T) {
 	}
 }
 
-// This finite listener exits its owning goroutine on Close because the production
-// accept loop currently retries all Accept errors, including closed listeners.
-// No shutdown redesign is needed to test the actual accept loop without leaks.
+// A controlled listener reports ordinary closure to the production accept loop.
 type handshakeListener struct {
 	incoming chan net.Conn
 	stop     chan struct{}
@@ -258,7 +255,6 @@ func (l *handshakeListener) Accept() (net.Conn, error) {
 	case c := <-l.incoming:
 		return c, nil
 	case <-l.stop:
-		runtime.Goexit()
 		return nil, net.ErrClosed
 	}
 }
