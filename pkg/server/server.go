@@ -20,6 +20,10 @@ import (
 // Server contains state for one NVRemoted server run. Configure it before use;
 // it must not be copied or served again, even after the first run has ended.
 type Server struct {
+	// Admission defines finite physical limits and backed channel entitlements.
+	// Zero fields select server policy defaults. Configure before serving.
+	Admission AdmissionConfig
+	capacity  *capacity
 	// MaxMessageSize bounds the encoded bytes of each incoming JSON value,
 	// including whitespace inside the value but excluding whitespace between
 	// values. Nonpositive values use 4 MiB. Oversize closes the connection
@@ -150,6 +154,23 @@ func (srv *Server) acceptClientsWithRetry(listener net.Listener, wait func(time.
 		if srv.isStopping() {
 			return net.ErrClosed
 		}
+		// Gate the serial acceptor before acquiring another socket. Kernel
+		// backlog sockets are not server-owned; no overflow socket can push
+		// physical ownership above the configured ceiling, even briefly.
+		srv.lifecycleMu.Lock()
+		budget, stop := srv.capacity, srv.stop
+		srv.lifecycleMu.Unlock()
+		if budget != nil {
+			ready, changed := budget.acceptReady()
+			if !ready {
+				select {
+				case <-changed:
+				case <-stop:
+					return net.ErrClosed
+				}
+				continue
+			}
+		}
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -214,6 +235,11 @@ func (srv *Server) beginRun() error {
 		return ErrServerUsed
 	}
 	srv.started = true
+	var err error
+	srv.capacity, err = newCapacity(srv.Admission)
+	if err != nil {
+		return err
+	}
 	srv.stop = make(chan struct{})
 	srv.done = make(chan struct{})
 	srv.active = make(map[*client]struct{})
@@ -222,6 +248,7 @@ func (srv *Server) beginRun() error {
 	srv.registry.clients = make(map[uint64]channelMember)
 	srv.registry.channels = make(map[string]*channel)
 	srv.registry.statsPassword = srv.StatsPassword
+	srv.registry.capacity = srv.capacity
 	srv.registry.createdTime = now
 	srv.registry.maxChannelsTime = now
 	srv.registry.maxClientsTime = now
@@ -240,6 +267,9 @@ func (srv *Server) stopRun() {
 	defer srv.lifecycleMu.Unlock()
 	if !srv.stopping {
 		srv.stopping = true
+		if srv.capacity != nil {
+			srv.capacity.stopAdmission()
+		}
 		close(srv.stop)
 	}
 }
@@ -264,6 +294,9 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 		close(srv.done)
 	} else if !srv.stopping {
 		srv.stopping = true
+		if srv.capacity != nil {
+			srv.capacity.stopAdmission()
+		}
 		close(srv.stop)
 	}
 	done := srv.done
@@ -304,10 +337,29 @@ func (srv *Server) finishRun() {
 	srv.clients.Wait()
 	// Client cleanup acknowledges channel removal before channel.start returns.
 	srv.registry.workers.Wait()
+	srv.capacity.shutdown()
 	close(srv.done)
 }
 
 func (srv *Server) serve(listener net.Listener) error {
+	expiry := time.NewTimer(time.Hour)
+	defer expiry.Stop()
+	var expiryCH <-chan time.Time
+	resetExpiry := func() {
+		if !expiry.Stop() {
+			select {
+			case <-expiry.C:
+			default:
+			}
+		}
+		next := srv.capacity.nextExpiry()
+		if next.IsZero() {
+			expiryCH = nil
+			return
+		}
+		expiry.Reset(time.Until(next))
+		expiryCH = expiry.C
+	}
 	srv.Log.WithFields(logrus.Fields{
 		"time_between_pings":  srv.TimeBetweenPings,
 		"pings_until_timeout": srv.PingsUntilTimeout,
@@ -323,6 +375,11 @@ func (srv *Server) serve(listener net.Listener) error {
 	}
 	for {
 		select {
+		case <-srv.capacity.changed:
+			resetExpiry()
+		case now := <-expiryCH:
+			srv.capacity.expire(now)
+			resetExpiry()
 		case err := <-acceptDone:
 			if srv.isStopping() {
 				srv.closeListener(listener)

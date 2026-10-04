@@ -26,6 +26,25 @@ pingsUntilTimeout = 0
 # Leave this blank to disable stats.
 statsPassword = ""
 
+# Finite relay policy limits, enabled even when this section is omitted.
+# Size explicitly for larger existing public deployments. Physical capacity
+# must cover pendingLimit + admittedLimit. Credits include offline promises.
+[admission]
+hardLimit = 1152
+pendingLimit = 128
+tlsLimit = 64
+startupLimit = 128
+admittedLimit = 1024
+recoveryGrace = "60s"
+startupTimeout = "10s"
+rejectionWindow = "5s"
+rejectionInterval = "1s"
+overlapTimeout = "10s"
+# SHA-256 hex digests of exact UTF-8 channel strings, never plaintext keys.
+# Each listed channel permanently consumes 3 admitted credits (pair + overlap).
+# Protect this file: weak channel keys permit offline guessing of their digests.
+protectedChannels = []
+
 
 # Options for the NVRemoted service
 [nvremoted]

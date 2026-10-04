@@ -12,6 +12,7 @@ import (
 )
 
 type channel struct {
+	done    chan struct{} // empty-channel worker has completed teardown
 	name    string
 	members []channelMember
 
@@ -29,6 +30,7 @@ type channel struct {
 }
 
 type channelMember struct {
+	client         *client // nil for in-process synthetic members
 	id             uint64
 	connectionType string
 	events         chan<- Message
@@ -55,6 +57,30 @@ type joinChannelRequest struct {
 // joinChannel adds a member to the named channel, creating it if it doesn't already exist.
 func joinChannel(name string, member channelMember, reg *registry) (*channel, []channelMember, error) {
 	reg.lock.Lock()
+	if _, exists := reg.clients[member.id]; exists {
+		reg.lock.Unlock()
+		return nil, nil, errors.New("already a member")
+	}
+	if member.client != nil && reg.capacity != nil {
+		c := member.client
+		if !reg.capacity.beginAdmission(c) {
+			reg.lock.Unlock()
+			return nil, nil, errAdmissionExpired
+		}
+		overlap, reason := reg.capacity.admit(c, name, member.connectionType, time.Now())
+		if reason != "" {
+			reg.lock.Unlock()
+			if reason == capacityReasonTimedOut || reason == capacityReasonBadState {
+				return nil, nil, errAdmissionExpired
+			}
+			return nil, nil, errCapacity
+		}
+		c.overlap = overlap
+		if overlap {
+			c.overlapStart <- reg.capacity.overlapDeadline(c)
+		}
+		c.finishStartup()
+	}
 	reg.clients[member.id] = member
 	if len(reg.clients) > reg.maxClients {
 		reg.maxClients = len(reg.clients)
@@ -64,6 +90,7 @@ func joinChannel(name string, member channelMember, reg *registry) (*channel, []
 	c, ok := reg.channels[name]
 	if !ok {
 		c = &channel{
+			done:     make(chan struct{}),
 			name:     name,
 			members:  []channelMember{},
 			messages: make(chan channelMessage),
@@ -73,6 +100,7 @@ func joinChannel(name string, member channelMember, reg *registry) (*channel, []
 		reg.channels[name] = c
 		reg.workers.Add(1)
 		go func() {
+			defer close(c.done)
 			defer reg.workers.Done()
 			c.start(reg)
 		}()
@@ -104,6 +132,9 @@ func joinChannel(name string, member channelMember, reg *registry) (*channel, []
 	case error:
 		return c, nil, result
 	case []channelMember:
+		if member.client != nil {
+			reg.capacity.markSuccessful(member.client)
+		}
 		return c, result, nil
 	}
 
@@ -112,7 +143,7 @@ func joinChannel(name string, member channelMember, reg *registry) (*channel, []
 
 type leaveChannelRequest struct {
 	id   uint64
-	resp chan struct{}
+	resp chan bool // true when the empty worker will exit
 }
 
 // leave removes a member from the channel, destroying the channel if it is empty.
@@ -122,10 +153,12 @@ type leaveChannelRequest struct {
 func (c *channel) leave(id uint64) {
 	req := leaveChannelRequest{
 		id:   id,
-		resp: make(chan struct{}),
+		resp: make(chan bool),
 	}
 	c.parts <- req
-	<-req.resp
+	if empty := <-req.resp; empty {
+		<-c.done
+	}
 }
 
 func (c *channel) start(reg *registry) {
@@ -181,7 +214,7 @@ func (c *channel) start(reg *registry) {
 			reg.lock.Unlock()
 
 			// Acknowledge only after all membership and registry cleanup.
-			req.resp <- struct{}{}
+			req.resp <- empty
 			if empty {
 				return
 			}

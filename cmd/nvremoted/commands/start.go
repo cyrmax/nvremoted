@@ -59,6 +59,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 		if err := stopError(ctx); err != nil {
 			return nil, err
 		}
+		admission, err := readAdmissionConfig(viper.GetViper())
+		if err != nil {
+			return nil, fmt.Errorf("admission configuration: %w", err)
+		}
 
 		var motd string
 		motdFile := os.ExpandEnv(viper.GetString("nvremoted.motdFile"))
@@ -69,6 +73,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			return nil, err
 		}
 		srv := &server.Server{
+			Admission:         admission,
 			TimeBetweenPings:  viper.GetDuration("server.timeBetweenPings") * time.Second,
 			PingsUntilTimeout: viper.GetInt("server.pingsUntilTimeout"),
 			MOTD:              strings.TrimSpace(motd),
