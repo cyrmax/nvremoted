@@ -99,6 +99,9 @@ type leaveChannelRequest struct {
 }
 
 // leave removes a member from the channel, destroying the channel if it is empty.
+// leave waits for channel and registry removal, including empty-channel cleanup.
+// No channel delivery or registry ping dispatch can target id after it returns.
+// The caller must keep receiving events until then to unblock in-flight sends.
 func (c *channel) leave(id uint64) {
 	req := leaveChannelRequest{
 		id:   id,
@@ -140,25 +143,26 @@ func (c *channel) start(reg *registry) {
 					c.broadcast(leftChannelMSG(member))
 				}
 			}
-			// Tell the requester the removal is complete.
-			// This does not mean a member was actually removed, if the specified ID wasn't already in the channel.
-			req.resp <- struct{}{}
-
 			reg.lock.Lock()
 			delete(reg.clients, req.id)
 			// Destroy the channel if there are no more members and no more pending joins
 			c.pendingJoinsLock.Lock()
-			if len(c.members) == 0 && c.pendingJoins == 0 {
+			empty := len(c.members) == 0 && c.pendingJoins == 0
+			if empty {
 				delete(reg.channels, c.name)
 				if c.isE2e() {
 					reg.numE2eChannels--
 				}
-				c.pendingJoinsLock.Unlock()
-				reg.lock.Unlock()
-				return
 			}
 			c.pendingJoinsLock.Unlock()
 			reg.lock.Unlock()
+
+			// Acknowledge only after all membership and registry cleanup. Taking
+			// the write lock also waits for any in-flight periodic dispatch.
+			req.resp <- struct{}{}
+			if empty {
+				return
+			}
 
 		case msg := <-c.messages:
 			for _, member := range c.members {

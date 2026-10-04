@@ -57,15 +57,7 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 		<-finished
 		<-finished
 
-		// The active channel and server registry may still be sending events to the client after requesting removal.
-		// The events channel needs to be closed and drained to prevent these goroutines from hanging.
-		if c.channel != nil {
-			c.channel.leave(c.id)
-		}
-
-		close(c.events)
-		for range c.events {
-		}
+		c.leaveChannel()
 
 		conn.Close()
 		srv.Log.WithFields(logrus.Fields{
@@ -74,6 +66,28 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 			"reason":      c.stopReason,
 		}).Info("Client disconnected")
 	}()
+}
+
+// leaveChannel runs after both client goroutines have finished. Keep receiving
+// events until channel delivery and registry dispatch can no longer target us:
+// either sender may already be blocked on this queue. The queue is never closed;
+// handleClient terminates via recv, and retained member references do not own it.
+func (c *client) leaveChannel() {
+	if c.channel == nil {
+		return
+	}
+	left := make(chan struct{})
+	go func() {
+		c.channel.leave(c.id)
+		close(left)
+	}()
+	for {
+		select {
+		case <-c.events:
+		case <-left:
+			return
+		}
+	}
 }
 
 // readFromClient reads data from the client socket, marshals it, and sends the resulting clientMessage to the client's events channel to be handled.
