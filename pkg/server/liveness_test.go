@@ -200,25 +200,8 @@ func TestDisconnectedClientLeavesRegistry(t *testing.T) {
 				peer.Close()
 			}
 			awaitLivenessSignal(t, hook.done)
-			// Channel removal acknowledges leave before deleting registry entries.
-			// Wait for that asynchronous cleanup without assuming scheduler order.
-			ticker := time.NewTicker(time.Millisecond)
-			defer ticker.Stop()
-			timeout := time.NewTimer(5 * time.Second)
-			defer timeout.Stop()
-			for {
-				srv.registry.lock.RLock()
-				empty := len(srv.registry.clients) == 0 && len(srv.registry.channels) == 0
-				srv.registry.lock.RUnlock()
-				if empty {
-					break
-				}
-				select {
-				case <-ticker.C:
-				case <-timeout.C:
-					t.Fatal("disconnected client remains in registry")
-				}
-			}
+			// Disconnect is logged only after leave has completed all cleanup.
+			assertLifecycleRegistryEmpty(t, &srv.registry)
 		})
 	}
 }
