@@ -19,6 +19,18 @@ import (
 
 // Server Contains state for an NVRemoted server.
 type Server struct {
+	// EventQueueSize bounds pending events per client (in addition to the event
+	// being handled). Nonpositive values use 64, allowing short bursts without
+	// accumulating an unbounded backlog. Overflow disconnects the client; no
+	// message types are dropped or coalesced on a continuing connection.
+	EventQueueSize int
+
+	// WriteTimeout bounds each response write, independently of pings and TCP
+	// keepalive. Nonpositive values use 10 seconds, tolerating transient network
+	// stalls even when there are no more events. This is a socket write deadline,
+	// not a timeout for TLS handshake reads or the entire send operation.
+	WriteTimeout time.Duration
+
 	// TimeBetweenPings specifies the amount of time that will elapse before clients will be sent a ping.
 	// If 0, no pings will be sent.
 	TimeBetweenPings time.Duration
@@ -134,17 +146,31 @@ func (srv *Server) Serve(listener net.Listener) {
 		defer ticker.Stop()
 		pingsCH = ticker.C
 	}
-	pingMSG := pingMessage{}
 
 	for {
 		select {
 		case <-pingsCH:
-			srv.registry.lock.RLock()
-			for _, member := range srv.registry.clients {
-				member.events <- pingMSG
-			}
-			srv.registry.lock.RUnlock()
+			srv.dispatchPings()
 		}
+	}
+}
+
+const (
+	defaultEventQueueSize = 64
+	defaultWriteTimeout   = 10 * time.Second
+)
+
+// Snapshot under the registry lock, then deliver without holding it. Queues
+// remain open throughout cleanup, so a retained member is safe to enqueue to.
+func (srv *Server) dispatchPings() {
+	srv.registry.lock.RLock()
+	members := make([]channelMember, 0, len(srv.registry.clients))
+	for _, member := range srv.registry.clients {
+		members = append(members, member)
+	}
+	srv.registry.lock.RUnlock()
+	for _, member := range members {
+		member.enqueue(pingMessage{})
 	}
 }
 

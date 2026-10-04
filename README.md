@@ -13,6 +13,19 @@ this is not a 15-second disconnect timeout. Transport errors and disconnects
 stop the client and remove its channel membership. Keepalive cannot detect a
 stalled client application while its operating system still responds to TCP.
 
+Each client has a bounded FIFO queue of 64 pending server events, in addition
+to the event being handled. A full queue disconnects that client rather than
+dropping or coalescing messages on a continuing connection. Each response gets
+a 10-second socket write deadline; a timeout or write error stops the connection
+and prevents further protocol writes. These limits are independent of ping and
+TCP keepalive settings. The write deadline does not bound reads during an
+unfinished TLS handshake; there is currently no TLS handshake timeout.
+
+Go API users can set `server.Server.EventQueueSize` and
+`server.Server.WriteTimeout` before serving clients; nonpositive values use
+64 and 10 seconds, respectively. The CLI uses these defaults; there are no
+CLI flags or TOML keys for these limits.
+
 To use:
 
 * `go install github.com/n0ot/nvremoted/cmd/nvremoted`

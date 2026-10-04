@@ -56,8 +56,10 @@ func newLifecycleRegistry() *registry {
 
 func joinLifecycleClient(t *testing.T, reg *registry, name string, id uint64) *client {
 	t.Helper()
-	c := &client{id: id, events: make(chan Message, 1)}
-	ch, _, err := joinChannel(name, channelMember{id: id, connectionType: "master", events: c.events}, reg)
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { conn.Close(); peer.Close() })
+	c := &client{id: id, conn: conn, events: make(chan Message, defaultEventQueueSize)}
+	ch, _, err := joinChannel(name, channelMember{id: id, connectionType: "master", events: c.events, stop: c.stop}, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +108,9 @@ func TestClientLeaveUnblocksInFlightPingDispatch(t *testing.T) {
 	c := joinLifecycleClient(t, reg, "test", 7)
 	// The handler has exited with a full queue. Pin the dispatcher to this
 	// member under the same read lock used by Server.Serve, before cleanup.
-	c.events <- pingMessage{}
+	for i := 0; i < cap(c.events); i++ {
+		c.events <- pingMessage{}
+	}
 	dispatchStarted := make(chan struct{})
 	dispatchDone := make(chan struct{})
 	go func() {
@@ -140,8 +144,10 @@ func TestClientLeaveUnblocksChannelDelivery(t *testing.T) {
 		t.Fatalf("join notification = %#v", msg)
 	}
 	// Stop consuming the departing member's queue. Delivery of the next
-	// message cannot complete until cleanup starts draining it.
-	departing.events <- pingMessage{}
+	// message disconnects it; cleanup must still drain retained events safely.
+	for i := 0; i < cap(departing.events); i++ {
+		departing.events <- pingMessage{}
+	}
 	msg := channelMessage{origin: 99, msg: map[string]interface{}{"type": "test"}}
 	departing.channel.messages <- msg
 	left := make(chan struct{})
@@ -188,7 +194,9 @@ func TestConcurrentClientLeavesWithPingDispatch(t *testing.T) {
 	third := joinLifecycleClient(t, reg, "E2E_"+strings.Repeat("a", 64), 9)
 	clients := []*client{first, second, third}
 	for _, c := range clients {
-		c.events <- pingMessage{}
+		for i := 0; i < cap(c.events); i++ {
+			c.events <- pingMessage{}
+		}
 	}
 	dispatchStarted := make(chan struct{})
 	dispatchDone := make(chan struct{})

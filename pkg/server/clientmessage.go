@@ -213,6 +213,7 @@ func handleClientJoin(c *client, msg Message) {
 		id:             c.id,
 		connectionType: joinMSG.ConnectionType,
 		events:         c.events,
+		stop:           c.stop,
 	}
 
 	if ch, members, err := joinChannel(joinMSG.Channel, member, c.registry); err != nil {

@@ -176,7 +176,8 @@ func TestDisconnectedClientLeavesRegistry(t *testing.T) {
 			hook := &disconnectedHook{done: make(chan struct{})}
 			log.AddHook(hook)
 			srv := &Server{Log: log, registry: registry{clients: make(map[uint64]channelMember), channels: make(map[string]*channel)}}
-			srv.serveClient(conn, 7, "test peer")
+			observed := &backpressureConn{Conn: conn, writes: make(chan struct{}, 4)}
+			srv.serveClient(observed, 7, "test peer")
 			peer.SetDeadline(time.Now().Add(5 * time.Second))
 			if _, err := io.WriteString(peer, "{\"type\":\"join\",\"channel\":\"test\",\"connection_type\":\"master\"}\n"); err != nil {
 				t.Fatal(err)
@@ -191,7 +192,7 @@ func TestDisconnectedClientLeavesRegistry(t *testing.T) {
 			if failWrite {
 				// Fail a server event write while its reader is blocked on an idle
 				// connection. This must wake the reader so both goroutines exit.
-				conn.SetWriteDeadline(time.Now().Add(-time.Second))
+				observed.expireWrites.Store(true)
 				srv.registry.lock.RLock()
 				events := srv.registry.clients[7].events
 				srv.registry.lock.RUnlock()
