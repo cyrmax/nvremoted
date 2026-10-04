@@ -159,10 +159,14 @@ func (srv *Server) readFromClient(c *client, finished chan<- struct{}) {
 
 	// NVDA Remote clients do not acknowledge server pings. Silence is valid;
 	// transport errors detect dead peers, and stop closes the socket to unblock us.
-	dec := json.NewDecoder(c.conn)
+	reader := newMessageReader(c.conn, srv.MaxMessageSize)
 
 	for !c.isStopped() {
-		msg, err := unmarshalClientMessage(c.id, dec)
+		raw, err := reader.read()
+		var msg Message
+		if err == nil {
+			msg, err = unmarshalClientMessage(c.id, raw)
+		}
 		// handleClient could have finished while the above read was blocking.
 		if err == nil {
 			c.recv <- msg
@@ -179,6 +183,12 @@ func (srv *Server) readFromClient(c *client, finished chan<- struct{}) {
 		}
 		if err == io.EOF {
 			c.stop("Client disconnected")
+			return
+		}
+		if err == errMessageTooLarge {
+			// Close immediately: an unread/malicious peer must not delay stop
+			// behind the serialized response write path.
+			c.stop("Incoming message too large")
 			return
 		}
 		if _, ok := err.(*json.UnmarshalTypeError); ok {
@@ -314,15 +324,10 @@ func (c *client) sendInternalError() {
 	c.sendError("internal error")
 }
 
-func unmarshalClientMessage(id uint64, dec *json.Decoder) (Message, error) {
+func unmarshalClientMessage(id uint64, raw []byte) (Message, error) {
 	// The raw JSON needs to be stored, because it will be unmarshalled twice,
 	// first to a GenericClientMessage to get its type, then to the more specific Message type.
 	// All returned messages will implement clientMessage, except for those of type message.ChannelMessage.
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
-		return nil, err
-	}
-
 	var genericMSG GenericClientMessage
 	if err := json.Unmarshal(raw, &genericMSG); err != nil {
 		return nil, err
