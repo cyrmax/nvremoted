@@ -10,6 +10,7 @@ import (
 )
 
 type registry struct {
+	capacity        *capacity
 	lock            sync.RWMutex   // Protects the entire registry
 	workers         sync.WaitGroup // Channel goroutines; wait after all clients finish.
 	clients         map[uint64]channelMember
@@ -25,6 +26,7 @@ type registry struct {
 
 // Stats contains summary information about a registry.
 type Stats struct {
+	Admission       CapacityStats `json:"admission"`
 	Uptime          time.Duration `json:"uptime"`
 	NumChannels     int           `json:"num_channels"`
 	NumE2eChannels  int           `json:"num_e2e_channels"`
@@ -40,7 +42,12 @@ func (reg *registry) Stats() Stats {
 	reg.lock.RLock()
 	defer reg.lock.RUnlock()
 
+	var admission CapacityStats
+	if reg.capacity != nil {
+		admission = reg.capacity.stats()
+	}
 	return Stats{
+		Admission:       admission,
 		Uptime:          time.Since(reg.createdTime),
 		NumChannels:     len(reg.channels),
 		NumE2eChannels:  reg.numE2eChannels,

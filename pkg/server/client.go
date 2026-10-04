@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -18,46 +19,83 @@ import (
 
 // client represents a client on the server.
 type client struct {
-	id           uint64
-	conn         net.Conn
-	events       chan Message  // passes internal messages to a client
-	recv         chan Message  // passes messages to a client from the network
-	readNext     chan struct{} // Used by handleClient to ask readFromClient to read the next message
-	channel      *channel      // active channel
-	registry     *registry
-	encoder      *json.Encoder
-	sendMTX      sync.Mutex // Serializes the encoder and each write's deadline.
-	writeTimeout time.Duration
-	stopMTX      sync.RWMutex // Protects stopped and stopReason
-	stopped      bool
-	stopReason   string
-	log          *logrus.Logger
+	capacity       *capacity
+	startupDone    chan struct{}
+	startupOnce    sync.Once
+	rejected       atomic.Bool
+	rejectionInput chan struct{}
+	rejectionRole  string
+	rejection      rejectionSchedule
+	writeUntil     time.Time // protected by sendMTX; clips writes in rejection state
+	overlap        bool
+	overlapStart   chan time.Time
+	lifecycleDone  chan struct{}
+	id             uint64
+	conn           net.Conn
+	events         chan Message  // passes internal messages to a client
+	recv           chan Message  // passes messages to a client from the network
+	readNext       chan struct{} // Used by handleClient to ask readFromClient to read the next message
+	channel        *channel      // active channel
+	registry       *registry
+	encoder        *json.Encoder
+	sendMTX        sync.Mutex // Serializes the encoder and each write's deadline.
+	writeTimeout   time.Duration
+	stopMTX        sync.RWMutex // Protects stopped and stopReason
+	stopped        bool
+	stopReason     string
+	log            *logrus.Logger
 }
 
 // serveClient handles events sent and received by a client.
 func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
-	queueSize := srv.EventQueueSize
-	if queueSize <= 0 {
-		queueSize = defaultEventQueueSize
-	}
-	c := &client{
-		id:           id,
-		conn:         conn,
-		events:       make(chan Message, queueSize),
-		recv:         make(chan Message),
-		readNext:     make(chan struct{}),
-		registry:     &srv.registry,
-		encoder:      json.NewEncoder(conn),
-		log:          srv.Log,
-		writeTimeout: srv.WriteTimeout,
-	}
-
+	// Allocate only minimal state until a physical pending permit is held.
+	c := &client{id: id, conn: conn, log: srv.Log}
 	srv.lifecycleMu.Lock()
 	if srv.stopping {
 		srv.lifecycleMu.Unlock()
 		c.stop("Server shutdown")
 		return
 	}
+	if srv.capacity == nil {
+		var err error
+		srv.capacity, err = newCapacity(srv.Admission)
+		if err != nil {
+			srv.lifecycleMu.Unlock()
+			c.stop("Admission configuration error")
+			return
+		}
+		srv.registry.lock.Lock()
+		srv.registry.capacity = srv.capacity
+		srv.registry.lock.Unlock()
+	}
+	c.capacity = srv.capacity
+	_, isTLS := conn.(*tls.Conn)
+	if !c.capacity.reserve(c, isTLS) {
+		srv.lifecycleMu.Unlock()
+		c.stop("Pre-join capacity exhausted")
+		return
+	}
+	queueSize := srv.EventQueueSize
+	if queueSize <= 0 {
+		queueSize = defaultEventQueueSize
+	}
+	*c = client{
+		capacity:       srv.capacity,
+		startupDone:    make(chan struct{}),
+		overlapStart:   make(chan time.Time, 1),
+		lifecycleDone:  make(chan struct{}),
+		rejectionInput: make(chan struct{}, 1),
+		id:             id,
+		conn:           conn,
+		events:         make(chan Message, queueSize),
+		recv:           make(chan Message),
+		readNext:       make(chan struct{}),
+		registry:       &srv.registry,
+		encoder:        json.NewEncoder(conn),
+		log:            srv.Log,
+		writeTimeout:   srv.WriteTimeout,
+	}
+
 	if srv.active == nil {
 		srv.active = make(map[*client]struct{})
 	}
@@ -75,12 +113,14 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 
 	go func() {
 		defer func() {
+			c.capacity.release(c, time.Now())
 			srv.lifecycleMu.Lock()
 			delete(srv.active, c)
 			srv.lifecycleMu.Unlock()
 			srv.clients.Done()
 		}()
 		defer func() {
+			c.capacity.cleaning(c)
 			c.leaveChannel()
 			conn.Close()
 			c.stopMTX.RLock()
@@ -119,6 +159,16 @@ func (srv *Server) serveClient(conn net.Conn, id uint64, remoteHost string) {
 			}
 		}
 
+		if isTLS && !c.capacity.established(c) {
+			c.stop("Startup capacity exhausted")
+			return
+		}
+		startupFinished := make(chan struct{})
+		go c.watchStartup(startupFinished)
+		overlapFinished := make(chan struct{})
+		go c.watchOverlap(overlapFinished)
+		defer func() { close(c.lifecycleDone); <-overlapFinished }()
+		defer func() { c.finishStartup(); <-startupFinished }()
 		go srv.readFromClient(c, finished)
 		go srv.handleClient(c, finished)
 		// Wait for both readFromClient and handleClient to finish.
@@ -162,6 +212,20 @@ func (srv *Server) readFromClient(c *client, finished chan<- struct{}) {
 	reader := newMessageReader(c.conn, srv.MaxMessageSize)
 
 	for !c.isStopped() {
+		if c.rejected.Load() {
+			var buffer [4096]byte
+			for !c.isStopped() {
+				n, err := reader.Read(buffer[:])
+				if n > 0 {
+					c.noteRejectedInput()
+				}
+				if err != nil {
+					c.stop("Rejected client disconnected")
+					return
+				}
+			}
+			return
+		}
 		raw, err := reader.read()
 		var msg Message
 		if err == nil {
@@ -207,10 +271,7 @@ func (srv *Server) readFromClient(c *client, finished chan<- struct{}) {
 
 // handleClient handles events sent on the client's events channel, serializes outgoing messages, and sends them to the client.
 func (srv *Server) handleClient(c *client, finished chan<- struct{}) {
-	defer func() {
-		finished <- struct{}{}
-	}()
-
+	defer func() { finished <- struct{}{} }()
 	// Send the MOTD when the client connects
 	if srv.MOTD != "" {
 		c.send(ClientMOTDResponse{
@@ -218,33 +279,66 @@ func (srv *Server) handleClient(c *client, finished chan<- struct{}) {
 			MOTD: srv.MOTD,
 		})
 	}
-
+	repeat := time.NewTimer(time.Hour)
+	repeat.Stop()
+	defer repeat.Stop()
+	var repeatCH <-chan time.Time
+	updateRejection := func() bool {
+		now := time.Now()
+		if !now.Before(c.rejection.deadline) {
+			c.stop("Capacity rejection completed")
+			return false
+		}
+		if c.rejection.announce(now) {
+			c.announceCapacity()
+		}
+		if !repeat.Stop() {
+			select {
+			case <-repeat.C:
+			default:
+			}
+		}
+		repeat.Reset(c.rejection.next(time.Now()))
+		repeatCH = repeat.C
+		return true
+	}
 	for {
 		select {
+		case <-repeatCH:
+			if !updateRejection() {
+				repeatCH = nil
+			}
+		case <-c.rejectionInput:
+			c.rejection.input = true
+			if !updateRejection() {
+				repeatCH = nil
+			}
 		case msg, ok := <-c.recv:
 			if !ok {
-				return // The client was stopped.
+				return
 			}
-
+			if c.isStopped() {
+				c.readNext <- struct{}{}
+				continue
+			}
 			if handlerFunc := clientMessageHandlers[msg.Name()]; handlerFunc == nil {
-				c.log.WithFields(logrus.Fields{
-					"id":           c.id,
-					"message_name": msg.Name(),
-				}).Warn("No handler found for client message")
+				c.log.WithFields(logrus.Fields{"id": c.id, "message_name": msg.Name()}).Warn("No handler found for client message")
 				c.sendInternalError()
 				c.stop("internal error")
 			} else {
 				handlerFunc(c, msg)
 			}
-			// Tell readFromClient to read the next message
+			if c.rejected.Load() {
+				repeat.Reset(c.rejection.next(time.Now()))
+				repeatCH = repeat.C
+			}
 			c.readNext <- struct{}{}
-
 		case msg := <-c.events:
+			if c.rejected.Load() {
+				continue
+			}
 			if handlerFunc := clientEventHandlers[msg.Name()]; handlerFunc == nil {
-				c.log.WithFields(logrus.Fields{
-					"id":           c.id,
-					"message_name": msg.Name(),
-				}).Warn("No handler found for client event")
+				c.log.WithFields(logrus.Fields{"id": c.id, "message_name": msg.Name()}).Warn("No handler found for client event")
 				c.sendInternalError()
 				c.stop("internal error")
 			} else {
@@ -294,7 +388,11 @@ func (c *client) send(resp Message) {
 	if timeout <= 0 {
 		timeout = defaultWriteTimeout
 	}
-	err := c.conn.SetWriteDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	if !c.writeUntil.IsZero() && c.writeUntil.Before(deadline) {
+		deadline = c.writeUntil
+	}
+	err := c.conn.SetWriteDeadline(deadline)
 	if err == nil {
 		err = c.encoder.Encode(resp)
 	}

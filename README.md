@@ -1,5 +1,19 @@
 NVRemoted is an implementation of the [NVDA Remote][] server in Go.
 
+Admission control is enabled with finite server policy defaults: 1024 admitted
+credits, 128 pending connections and a 1152 hard physical ceiling, including
+cleanup. Every accepted ordinary channel has backed capacity for one master
+and one slave; extra members are best effort. Offline ordinary channels retain
+their pair for 60 seconds after cleanup. Operators can configure permanent
+protected channels by SHA-256 digest, including one bounded reconnect overlap.
+Channel-aware capacity refusals speak a separate explanation to controllers
+for up to 5 seconds; existing MOTD semantics stay unchanged. Protection cannot
+guarantee passage through an exhausted TCP/TLS/pre-join path or prevent L4 DDoS.
+Old TOML files keep working with these finite defaults; larger installations
+should size the new `[admission]` section explicitly. See
+[configuration, arithmetic and security boundaries](docs/admission-control.md)
+and [the example](examples/nvremoted.toml).
+
 Incoming JSON values are limited to 4 MiB before protocol decoding or relay.
 Oversize immediately closes the connection with the logged reason
 `Incoming message too large`, without a protocol response or partial forwarding.

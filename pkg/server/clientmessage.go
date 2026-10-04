@@ -4,7 +4,13 @@
 
 package server
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var errCapacity = errors.New("server at capacity")
+var errAdmissionExpired = errors.New("startup admission expired")
 
 var clientMessages map[string]func() Message
 var clientMessageHandlers map[string]clientMessageHandlerFunc
@@ -210,6 +216,7 @@ func handleClientJoin(c *client, msg Message) {
 	}
 
 	member := channelMember{
+		client:         c,
 		id:             c.id,
 		connectionType: joinMSG.ConnectionType,
 		events:         c.events,
@@ -217,9 +224,18 @@ func handleClientJoin(c *client, msg Message) {
 	}
 
 	if ch, members, err := joinChannel(joinMSG.Channel, member, c.registry); err != nil {
+		if err == errCapacity {
+			c.beginRejection(joinMSG.ConnectionType)
+			return
+		}
+		if err == errAdmissionExpired {
+			c.stop("Startup admission timeout")
+			return
+		}
 		c.sendError(err.Error())
 		c.stop("protocol error")
 	} else {
+		c.channel = ch
 		memberResponses := []ClientMemberResponse{}
 		for _, member := range members {
 			memberResponses = append(memberResponses, clientMemberResponseFromChannelMember(member))
@@ -230,7 +246,6 @@ func handleClientJoin(c *client, msg Message) {
 			Channel: joinMSG.Channel,
 			Origin:  c.id,
 		})
-		c.channel = ch
 	}
 }
 
