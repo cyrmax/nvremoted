@@ -20,6 +20,12 @@ import (
 // Server contains state for one NVRemoted server run. Configure it before use;
 // it must not be copied or served again, even after the first run has ended.
 type Server struct {
+	// MaxMessageSize bounds the encoded bytes of each incoming JSON value,
+	// including whitespace inside the value but excluding whitespace between
+	// values. Nonpositive values use 4 MiB. Oversize closes the connection
+	// without forwarding the value or sending a protocol response.
+	MaxMessageSize int
+
 	// EventQueueSize bounds pending events per client (in addition to the event
 	// being handled). Nonpositive values use 64, allowing short bursts without
 	// accumulating an unbounded backlog. Overflow disconnects the client; no

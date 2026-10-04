@@ -1,5 +1,18 @@
 NVRemoted is an implementation of the [NVDA Remote][] server in Go.
 
+Incoming JSON values are limited to 4 MiB before protocol decoding or relay.
+Oversize immediately closes the connection with the logged reason
+`Incoming message too large`, without a protocol response or partial forwarding.
+Go API users can set `server.Server.MaxMessageSize` before serving; zero and
+negative values select the safe default, never unlimited input. The count
+includes all encoded bytes inside a value, including internal whitespace and
+JSON escapes, but excludes whitespace between values and the terminating LF.
+The CLI uses the default without new flags or TOML keys. This is a relay policy,
+not an NVDA clipboard limit; exceptionally large clipboard/speech payloads may
+need a larger API setting. Fragmented messages and historical JSON stream
+framing remain supported. See [the message limit design](docs/message-limit.md)
+for protocol evidence, buffering, memory implications and remaining limits.
+
 `server.timeBetweenPings` controls server ping delivery only (seconds; 0 disables
 pings). NVDA Remote clients do not acknowledge these pings, so valid idle
 connections are allowed. `server.pingsUntilTimeout` and `--pings-until-timeout`
