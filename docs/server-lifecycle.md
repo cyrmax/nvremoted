@@ -183,9 +183,8 @@ first stop reason, independent closes, failed starts, and reuse rejection.
 Completion barriers and worker synchronization verify finished owned work
 without global goroutine-count guesses or sleep-based polling.
 
-CLI signal integration remains a separate task: the command currently calls
-the serving method directly through `log.Fatal` and has no signal-driven
-shutdown caller. It should call `Shutdown`, wait for serving completion, and
-handle a successful return normally when that integration is added. Existing
-send warnings during intentional stop may also deserve a separate logging
-change. Neither follow-up changes these API guarantees.
+The CLI now owns startup cancellation, its listener and the signal-driven
+`Shutdown` caller; see [CLI termination lifecycle](cli-lifecycle.md) for the
+process budget, error precedence and exit policy. Existing send warnings
+during intentional stop may still deserve a separate logging change. Neither
+the CLI integration nor that follow-up changes these API guarantees.

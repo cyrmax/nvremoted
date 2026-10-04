@@ -5,7 +5,11 @@
 package commands
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -16,17 +20,13 @@ import (
 	"github.com/spf13/viper"
 )
 
-var (
-	log        *logrus.Logger
-	motd       string
-	disableTLS bool
-)
+var disableTLS bool
 
 // startCmd represents the start command
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Starts the NVRemoted server",
-	Run:   runServer,
+	RunE:  runServer,
 }
 
 func init() {
@@ -44,34 +44,82 @@ func init() {
 	viper.SetDefault("tls.useTls", true)
 }
 
-func runServer(cmd *cobra.Command, args []string) {
-	log = logrus.New()
-	log.Out = os.Stderr
-	log.Formatter = new(logrus.TextFormatter)
-	log.Level = logrus.DebugLevel
-
-	motdFile := os.ExpandEnv(viper.GetString("nvremoted.motdFile"))
-	if motdBuf, err := ioutil.ReadFile(motdFile); err == nil {
-		motd = string(motdBuf)
-	}
-
-	srv := &server.Server{
-		TimeBetweenPings:  viper.GetDuration("server.timeBetweenPings") * time.Second,
-		PingsUntilTimeout: viper.GetInt("server.pingsUntilTimeout"),
-		MOTD:              strings.TrimSpace(motd),
-		StatsPassword:     viper.GetString("server.statsPassword"),
-		Log:               log,
-	}
-
+func runServer(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	var log *logrus.Logger
+	var tlsConfig *tls.Config
 	bindAddr := viper.GetString("server.bind")
-	certFile := os.ExpandEnv(viper.GetString("tls.certFile"))
-	keyFile := os.ExpandEnv(viper.GetString("tls.keyFile"))
-	useTLS := viper.GetBool("tls.useTls")
+	useTLS := viper.GetBool("tls.useTls") && !disableTLS
+	err := startServer(ctx, func(ctx context.Context) (runningServer, error) {
+		log = logrus.New()
+		log.Out = os.Stderr
+		log.Formatter = new(logrus.TextFormatter)
+		log.Level = logrus.DebugLevel
+		log.Info("Starting NVRemoted")
+		if err := stopError(ctx); err != nil {
+			return nil, err
+		}
 
-	log.Info("Starting NVRemoted")
-	if useTLS && !disableTLS {
-		log.Fatal(srv.ListenAndServeTLS(bindAddr, certFile, keyFile))
-	} else {
-		log.Fatal(srv.ListenAndServe(bindAddr))
+		var motd string
+		motdFile := os.ExpandEnv(viper.GetString("nvremoted.motdFile"))
+		if motdBuf, err := ioutil.ReadFile(motdFile); err == nil {
+			motd = string(motdBuf)
+		}
+		if err := stopError(ctx); err != nil {
+			return nil, err
+		}
+		srv := &server.Server{
+			TimeBetweenPings:  viper.GetDuration("server.timeBetweenPings") * time.Second,
+			PingsUntilTimeout: viper.GetInt("server.pingsUntilTimeout"),
+			MOTD:              strings.TrimSpace(motd),
+			StatsPassword:     viper.GetString("server.statsPassword"),
+			Log:               log,
+		}
+		if err := stopError(ctx); err != nil {
+			return nil, err
+		}
+		if useTLS {
+			certFile := os.ExpandEnv(viper.GetString("tls.certFile"))
+			keyFile := os.ExpandEnv(viper.GetString("tls.keyFile"))
+			var err error
+			tlsConfig, err = loadTLSConfig(ctx, certFile, keyFile, tls.LoadX509KeyPair)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return srv, nil
+	}, func(ctx context.Context) (net.Listener, error) {
+		var lc net.ListenConfig
+		listener, err := lc.Listen(ctx, "tcp", bindAddr)
+		if err != nil {
+			return nil, fmt.Errorf("listen: %w", err)
+		}
+		if useTLS {
+			listener = tls.NewListener(listener, tlsConfig)
+		}
+		return listener, nil
+	}, shutdownTimeout)
+	if ctx.Err() != nil && (err == nil || err == errStopRequested) && log != nil {
+		log.Info("NVRemoted stopped")
 	}
+	return err
+}
+
+// The loader cannot interrupt an in-progress filesystem read. Check both sides
+// and preserve a required-read error even if cancellation happened meanwhile.
+func loadTLSConfig(ctx context.Context, certFile, keyFile string, load func(string, string) (tls.Certificate, error)) (*tls.Config, error) {
+	if err := stopError(ctx); err != nil {
+		return nil, err
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("No TLSConfig set in server, and no certFile/keyFile given")
+	}
+	cert, err := load(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load X.509 key pair: %w", err)
+	}
+	if err := stopError(ctx); err != nil {
+		return nil, err
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
