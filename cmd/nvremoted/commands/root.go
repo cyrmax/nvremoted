@@ -5,6 +5,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -27,45 +28,52 @@ and prints usage stats for other NVRemoted servers.`,
 	SilenceErrors:     true,
 	SilenceUsage:      true,
 	DisableAutoGenTag: true,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return initConfig(cmd.Context())
+	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute() {
-	if err := RootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+// Execute runs Cobra with process cancellation and a bounded stop budget.
+// It is called once by main; errors are reported at that process exit boundary.
+func Execute(ctx context.Context) error {
+	return supervise(ctx, shutdownTimeout, func(ctx context.Context) error {
+		return RootCmd.ExecuteContext(ctx)
+	})
 }
 
 func init() {
-	cobra.OnInitialize(initConfig)
-
 	RootCmd.PersistentFlags().StringVar(&cfgDir, "config", "", "config directory (default is $HOME/.config/nvremoted)")
 }
 
 // initConfig reads in config file and ENV variables if set.
-func initConfig() {
+func initConfig(ctx context.Context) error {
+	if err := stopError(ctx); err != nil {
+		return err
+	}
 	if cfgDir == "" {
-		// Find home directory.
 		home, err := homedir.Dir()
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			return fmt.Errorf("find home directory: %w", err)
 		}
-
-		// Search for config in $HOME/.config/nvremoted
 		cfgDir = path.Join(home, ".config", "nvremoted")
 	}
-
+	if err := stopError(ctx); err != nil {
+		return err
+	}
 	viper.AddConfigPath(cfgDir)
 	viper.SetConfigName("nvremoted")
-
-	os.Setenv("CONFDIR", cfgDir)
-
-	// If a config file is found, read it in.
-	if err := viper.ReadInConfig(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config file: %s\n", err)
-		os.Exit(1)
+	if err := os.Setenv("CONFDIR", cfgDir); err != nil {
+		return fmt.Errorf("set config directory: %w", err)
 	}
+	return readConfig(ctx, viper.ReadInConfig)
+}
+
+func readConfig(ctx context.Context, read func() error) error {
+	if err := stopError(ctx); err != nil {
+		return err
+	}
+	if err := read(); err != nil {
+		return fmt.Errorf("load config file: %w", err)
+	}
+	return stopError(ctx)
 }
