@@ -304,6 +304,11 @@ PGO experiment, но не доказывает representativeness production. Д
 `allocs.pprof` содержит sampled cumulative allocations с начала process, включая
 setup и предыдущие сценарии. Для сравнения transports используйте отдельные
 profiling runs в свежих processes; interval allocation totals находятся в JSON.
+Block/mutex snapshots также накопительные внутри process. Если один invocation
+проходит TCP и TLS либо repetitions, поздний snapshot включает более ранние
+sampling windows. Для attribution конкретного transport выбирайте его отдельным
+`TRANSPORT=tcp` или `TRANSPORT=tls` запуском. CPU stream начинается заново для
+каждого сценария; heap и allocation snapshots имеют другую semantics.
 Payload validation проверяет полное содержимое ациклического JSON структурным
 сравнением без reflection/cycle bookkeeping. Client JSON decode и проверка всё
 равно участвуют в process CPU/GC и могут ограничить workload.
