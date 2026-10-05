@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net"
@@ -136,5 +137,151 @@ func TestPerformanceRelayShutdownCleanup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPerformanceRelayPayloadComparison(t *testing.T) {
+	newValues := func() (map[string]any, map[string]any) {
+		expected := map[string]any{
+			"bench_seq": json.Number("0"),
+			"type":      "arbitrary",
+			"nullable":  nil,
+			"enabled":   true,
+			"count":     json.Number("12"),
+			"text":      "sample",
+			"nested": map[string]any{
+				"values": []any{json.Number("1"), nil, false, "x"},
+				"inner":  map[string]any{"active": true, "name": "node", "nullable": nil},
+			},
+		}
+		received := relayPerfCloneJSON(expected).(map[string]any)
+		received["bench_seq"] = json.Number("7")
+		received["origin"] = json.Number("0") // Server client IDs legitimately start at zero.
+		return expected, received
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   bool
+	}{
+		{name: "matching nested JSON", want: true},
+		{name: "missing top-level null replaced by extra null", mutate: func(m map[string]any) {
+			delete(m, "nullable")
+			m["extra"] = nil
+		}},
+		{name: "extra top-level field", mutate: func(m map[string]any) { m["extra"] = true }},
+		{name: "null differs from boolean", mutate: func(m map[string]any) { m["nullable"] = false }},
+		{name: "exact number spelling", mutate: func(m map[string]any) { m["count"] = json.Number("12.0") }},
+		{name: "number type mismatch", mutate: func(m map[string]any) { m["count"] = float64(12) }},
+		{name: "string type mismatch", mutate: func(m map[string]any) { m["text"] = []byte("sample") }},
+		{name: "boolean type mismatch", mutate: func(m map[string]any) { m["enabled"] = "true" }},
+		{name: "array order differs", mutate: func(m map[string]any) {
+			nested := m["nested"].(map[string]any)
+			nested["values"] = []any{nil, json.Number("1"), false, "x"}
+		}},
+		{name: "deep value differs", mutate: func(m map[string]any) {
+			nested := m["nested"].(map[string]any)
+			nested["inner"].(map[string]any)["name"] = "changed"
+		}},
+		{name: "missing nested null replaced by extra key", mutate: func(m map[string]any) {
+			nested := m["nested"].(map[string]any)
+			inner := nested["inner"].(map[string]any)
+			delete(inner, "nullable")
+			inner["extra"] = nil
+		}},
+		{name: "wrong sequence", mutate: func(m map[string]any) { m["bench_seq"] = json.Number("8") }},
+		{name: "non-integer sequence", mutate: func(m map[string]any) { m["bench_seq"] = json.Number("7.0") }},
+		{name: "missing origin", mutate: func(m map[string]any) { delete(m, "origin") }},
+		{name: "unsupported JSON value fails closed", mutate: func(m map[string]any) {
+			m["text"] = struct{ Value string }{"sample"}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expected, received := newValues()
+			if test.mutate != nil {
+				test.mutate(received)
+			}
+			got := relayPerfPayloadMatches(expected, 7, received)
+			if got != test.want {
+				t.Fatalf("relayPerfPayloadMatches() = %v, want %v", got, test.want)
+			}
+		})
+	}
+	unsupported := struct{ Value string }{"same"}
+	if relayPerfJSONEqual(unsupported, unsupported) {
+		t.Fatal("unsupported non-JSON value compared equal")
+	}
+
+	expected, received := newValues()
+	allocations := testing.AllocsPerRun(100, func() {
+		if !relayPerfPayloadMatches(expected, 7, received) {
+			t.Fatal("valid payload comparison failed")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("payload comparison allocated %.2f times per call, want zero", allocations)
+	}
+}
+
+func TestPerformanceRelayOriginValidation(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		origin         any
+		expectedOrigin uint64
+		wantValid      bool
+	}{
+		{name: "zero client ID is valid", origin: json.Number("0"), expectedOrigin: 0, wantValid: true},
+		{name: "matching client ID", origin: json.Number("5"), expectedOrigin: 5, wantValid: true},
+		{name: "wrong client ID", origin: json.Number("6"), expectedOrigin: 5},
+		{name: "missing client ID", origin: nil, expectedOrigin: 5},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, received := relayPerfOriginFixture(test.origin)
+			peer := &relayPerfPeer{index: 0}
+			collector := newRelayPerfCollector([]*relayPerfPeer{peer}, 1)
+			collector.start = perf.Now()
+			collector.end = collector.start.Add(time.Second)
+			collector.measurement = true
+			collector.expectedOrigins[0] = test.expectedOrigin
+			if !collector.reserve(7, collector.start, 0, 1, payload) {
+				t.Fatal("could not reserve fixture message")
+			}
+			actual := collector.setActual(7)
+			collector.markSent(7, 0, actual)
+			collector.receive(0, 7, received, 1, perf.Now())
+			if got := collector.corrupted == 0; got != test.wantValid {
+				t.Fatalf("origin validation valid=%v, want %v", got, test.wantValid)
+			}
+		})
+	}
+}
+
+func relayPerfOriginFixture(origin any) (map[string]any, map[string]any) {
+	expected := map[string]any{"bench_seq": json.Number("0"), "type": "key"}
+	received := map[string]any{"bench_seq": json.Number("7"), "type": "key"}
+	if origin != nil {
+		received["origin"] = origin
+	}
+	return expected, received
+}
+
+func relayPerfCloneJSON(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		clone := make(map[string]any, len(typed))
+		for key, child := range typed {
+			clone[key] = relayPerfCloneJSON(child)
+		}
+		return clone
+	case []any:
+		clone := make([]any, len(typed))
+		for i, child := range typed {
+			clone[i] = relayPerfCloneJSON(child)
+		}
+		return clone
+	default:
+		return typed
 	}
 }

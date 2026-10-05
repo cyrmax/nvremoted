@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -556,19 +555,66 @@ func relayPerfPayloadMatches(expected map[string]any, seq uint64, received map[s
 		return false
 	}
 	for key, expectedValue := range expected {
+		actualValue, ok := received[key]
+		if !ok {
+			return false
+		}
 		if key == "bench_seq" {
-			actual, ok := relayPerfSequence(received[key])
+			actual, ok := relayPerfSequence(actualValue)
 			if !ok || actual != seq {
 				return false
 			}
 			continue
 		}
-		if !reflect.DeepEqual(received[key], expectedValue) {
+		if !relayPerfJSONEqual(actualValue, expectedValue) {
 			return false
 		}
 	}
 	_, hasOrigin := received["origin"]
 	return hasOrigin
+}
+
+// relayPerfJSONEqual compares the JSON value subset produced by Decoder.UseNumber.
+// JSON payloads are acyclic, so direct recursion needs no reflection or cycle tracking.
+func relayPerfJSONEqual(actual, expected any) bool {
+	switch expectedValue := expected.(type) {
+	case nil:
+		return actual == nil
+	case bool:
+		actualValue, ok := actual.(bool)
+		return ok && actualValue == expectedValue
+	case string:
+		actualValue, ok := actual.(string)
+		return ok && actualValue == expectedValue
+	case json.Number:
+		actualValue, ok := actual.(json.Number)
+		return ok && actualValue == expectedValue
+	case []any:
+		actualValue, ok := actual.([]any)
+		if !ok || len(actualValue) != len(expectedValue) {
+			return false
+		}
+		for i := range expectedValue {
+			if !relayPerfJSONEqual(actualValue[i], expectedValue[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		actualValue, ok := actual.(map[string]any)
+		if !ok || len(actualValue) != len(expectedValue) {
+			return false
+		}
+		for key, expectedField := range expectedValue {
+			actualField, ok := actualValue[key]
+			if !ok || !relayPerfJSONEqual(actualField, expectedField) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func relayPerfJoin(peer *relayPerfPeer, channel, role string) error {

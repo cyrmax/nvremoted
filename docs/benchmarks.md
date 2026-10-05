@@ -188,6 +188,11 @@ Scheduled latency начинается в запланированный мом�
 write latency показывают ограничения генератора. При backpressure нагрузка не
 переклассифицируется в успешный меньший rate. Catch-up/bursts из-за scheduling
 отражаются в distributions; не предполагается идеальная точность таймеров OS.
+`requested_load_fully_offered` требует отсутствия missed offers, включая последние
+slots на границе measurement window. Несколько таких cutoff misses при полной
+доставке реально отправленных сообщений — ограничение генератора/window, а не
+доказательство saturation сервера. Смотрите `delivery_valid` отдельно; comparator
+консервативно исключает и эти строки.
 
 Считаются sent, expected recipient deliveries, received, in-window receive,
 missing, duplicates, out-of-order, corrupted/unexpected messages и disconnects.
@@ -219,6 +224,9 @@ Histograms принадлежат отдельным workers, но bounded bookk
 Нельзя объявлять найденный knee пределом relay без проверки generator lag,
 server queue/overflow и CPU/block/mutex profiles. Падение achieved rate само по
 себе не определяет, какая сторона стала bottleneck.
+Даже настоящий server overflow характеризует всю локальную конфигурацию:
+clients harness конкурируют с server за CPU и shared GC. Это наблюдение overload,
+а не доказательство изолированного server maximum для другой transport/machine.
 
 Windows RSS — current working set, Linux — current RSS, macOS — **peak RSS**;
 `rss_kind` явно различает их. Unsupported OS metrics помечаются unavailable.
@@ -227,6 +235,9 @@ GC CPU — runtime cumulative class metric; pauses — последние мак
 не объясняет автоматически p99. GC не принуждается. Heap может содержать garbage
 до следующего обычного цикла; memory/client delta включает клиентов harness и
 не должна трактоваться как точный размер production client struct.
+На Windows runtime pause statistics могут быть квантованы независимо от QPC
+часов harness: нулевой `PauseNs` не доказывает отсутствие паузы. Для выводов о GC
+сопоставляйте cycles, GC CPU, allocation rate, profiles и latency distributions.
 
 ## Profiles и будущий PGO experiment
 
@@ -258,8 +269,19 @@ go tool trace perf-results/<run>/profiles/tcp/1/execution.trace
 clients harness вместе с relay. Перед будущим PGO experiment проверьте hotspots
 и representativeness: профиль tiny microbenchmark для этого не подходит.
 Source matching общего server/TLS/JSON кода возможно, но test executable не
-покрывает CLI startup; production profile будет предпочтительнее при наличии
-подходящего workload. Сохраняйте профиль, commit, config и binary вместе.
+покрывает CLI startup. Общие JSON/TLS/runtime функции получают смешанные веса
+от server и benchmark clients; отсутствие harness функций в production binary
+не устраняет это смешение. Поэтому такой профиль подходит для исследовательского
+PGO experiment, но не доказывает representativeness production. Для окончательного
+выбора release profile предпочтителен server-only профиль из отдельного process
+или production workload. Сохраняйте профиль, commit, config и binary вместе.
+
+`allocs.pprof` содержит sampled cumulative allocations с начала process, включая
+setup и предыдущие сценарии. Для сравнения transports используйте отдельные
+profiling runs в свежих processes; interval allocation totals находятся в JSON.
+Payload validation проверяет полное содержимое ациклического JSON структурным
+сравнением без reflection/cycle bookkeeping. Client JSON decode и проверка всё
+равно участвуют в process CPU/GC и могут ограничить workload.
 
 PGO пока не включён в Mage release targets. Позднее baseline и PGO следует
 запускать с идентичными payloads/topology/rate/duration и сравнивать отдельно.
