@@ -91,6 +91,13 @@ shell, чтобы они случайно не меняли следующий p
 | `COMPONENT_FILTER` | Стандартный Go `-bench` regexp |
 | `BENCHTIME`, `COMPONENT_COUNT` | Go microbenchmark duration/iterations и repetitions |
 | `PROFILE` | Только `benchProfile`: `cpu`, `heap`, `allocs`, `goroutine`, `block`, `mutex`, `trace`, `all` |
+| `TIMEOUT` | Watchdog E2E test process (default `6h`); `0s` отключает, короткое значение полезно для диагностики зависаний |
+
+Watchdog ограничивает весь E2E запуск, включая setup и cleanup; это не latency
+assertion. При срабатывании Go выводит goroutine stacks и завершает test process,
+освобождая его sockets/listeners. Последний незавершённый сценарий не считается
+успешным. Для runs дольше шести часов увеличьте `TIMEOUT`. Component benchmarks
+имеют собственный стандартный Go lifecycle и не используют этот override.
 
 Без `FILTER` relay overrides формируют компактный custom scenario. `CLIENTS`
 формирует idle и joined custom scenarios. С `FILTER` overrides применяются к

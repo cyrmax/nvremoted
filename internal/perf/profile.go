@@ -49,6 +49,14 @@ func StartProfiles(directory, mode string) (func() error, error) {
 	}
 	return func() error {
 		var errs []error
+		// Stop sampling contention before shutting down CPU profiling. This
+		// keeps profiler shutdown itself outside the block/mutex sample window.
+		if mode == "block" || mode == "all" {
+			runtime.SetBlockProfileRate(0)
+		}
+		if mode == "mutex" || mode == "all" {
+			runtime.SetMutexProfileFraction(oldMutex)
+		}
 		if stream != nil {
 			if mode == "trace" {
 				trace.Stop()
@@ -56,12 +64,6 @@ func StartProfiles(directory, mode string) (func() error, error) {
 				pprof.StopCPUProfile()
 			}
 			errs = append(errs, stream.Close())
-		}
-		if mode == "block" || mode == "all" {
-			runtime.SetBlockProfileRate(0)
-		}
-		if mode == "mutex" || mode == "all" {
-			runtime.SetMutexProfileFraction(oldMutex)
 		}
 		// CPU runs also preserve snapshot profiles for convenient investigation.
 		names := []string{mode}

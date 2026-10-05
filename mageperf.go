@@ -121,6 +121,13 @@ func runPerformance(preset string, components bool) error {
 	if len(perf.Scenarios(c)) == 0 {
 		return fmt.Errorf("benchmark filter selects no scenarios")
 	}
+	timeout := 6 * time.Hour
+	if value := os.Getenv("NVREMOTED_BENCH_TIMEOUT"); value != "" {
+		timeout, err = time.ParseDuration(value)
+		if err != nil || timeout < 0 {
+			return fmt.Errorf("NVREMOTED_BENCH_TIMEOUT must be a nonnegative Go duration")
+		}
+	}
 	directory, err := performanceDirectory(c)
 	if err != nil {
 		return err
@@ -144,7 +151,7 @@ func runPerformance(preset string, components bool) error {
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
-	args := []string{"test", "-mod=readonly", "-tags=performance", "-run=^TestLocalPerformance$", "-count=1", "-timeout=0", "-v", "-o", binary, "./pkg/server"}
+	args := []string{"test", "-mod=readonly", "-tags=performance", "-run=^TestLocalPerformance$", "-count=1", "-timeout=" + timeout.String(), "-v", "-o", binary, "./pkg/server"}
 	return runPerformanceGo(io.MultiWriter(os.Stdout, file), []string{"NVREMOTED_BENCH_RUN=1", "NVREMOTED_BENCH_PRESET=" + preset, "NVREMOTED_BENCH_OUTPUT=" + abs}, args...)
 }
 
