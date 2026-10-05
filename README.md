@@ -1,5 +1,11 @@
 NVRemoted is an implementation of the [NVDA Remote][] server in Go.
 
+Local performance tooling is available through `mage bench`, `mage benchLong`
+and dedicated profiling/comparison targets. It measures component costs and
+real localhost TCP/TLS relay latency, delivery, saturation and lifecycle resources.
+Performance runs are excluded from CI. See the [benchmark guide](docs/benchmarks.md).
+Measured results and their limitations are recorded in the [local baseline](docs/performance-baseline.md).
+
 Admission control is enabled with finite server policy defaults: 1024 admitted
 credits, 128 pending connections and a 1152 hard physical ceiling, including
 cleanup. Every accepted ordinary channel has backed capacity for one master
