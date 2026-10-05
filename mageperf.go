@@ -142,17 +142,36 @@ func runPerformance(preset string, components bool) error {
 			return err
 		}
 	}
-	file, err := os.Create(filepath.Join(abs, "runner.txt"))
+	if c.Profile == "all" {
+		// CPU and contention samplers use separate fresh processes. Combining
+		// them can amplify observer contention and hung in local Windows runs.
+		for _, mode := range []string{"cpu", "block", "mutex"} {
+			child := filepath.Join(abs, mode)
+			if err := os.Mkdir(child, 0755); err != nil {
+				return err
+			}
+			fmt.Println("Isolated profile:", mode, child)
+			if err := runPerformanceScenarios(child, preset, mode, timeout); err != nil {
+				return fmt.Errorf("%s profile run: %w", mode, err)
+			}
+		}
+		return nil
+	}
+	return runPerformanceScenarios(abs, preset, c.Profile, timeout)
+}
+
+func runPerformanceScenarios(directory, preset, profile string, timeout time.Duration) error {
+	file, err := os.Create(filepath.Join(directory, "runner.txt"))
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	binary := filepath.Join(abs, "relay.test")
+	binary := filepath.Join(directory, "relay.test")
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
 	args := []string{"test", "-mod=readonly", "-tags=performance", "-run=^TestLocalPerformance$", "-count=1", "-timeout=" + timeout.String(), "-v", "-o", binary, "./pkg/server"}
-	return runPerformanceGo(io.MultiWriter(os.Stdout, file), []string{"NVREMOTED_BENCH_RUN=1", "NVREMOTED_BENCH_PRESET=" + preset, "NVREMOTED_BENCH_OUTPUT=" + abs}, args...)
+	return runPerformanceGo(io.MultiWriter(os.Stdout, file), []string{"NVREMOTED_BENCH_RUN=1", "NVREMOTED_BENCH_PRESET=" + preset, "NVREMOTED_BENCH_OUTPUT=" + directory, "NVREMOTED_BENCH_PROFILE=" + profile}, args...)
 }
 
 func runComponentBenchmarks(directory, preset string) error {

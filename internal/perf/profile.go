@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"time"
 )
 
 // StartProfiles is only called in dedicated profile runs, after network setup
@@ -16,11 +17,14 @@ func StartProfiles(directory, mode string) (func() error, error) {
 	if mode == "" {
 		return func() error { return nil }, nil
 	}
+	if mode == "all" {
+		return nil, errors.New("profile mode all is coordinated by mage benchProfile as separate CPU/block/mutex processes")
+	}
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		return nil, err
 	}
 	var stream *os.File
-	if mode == "cpu" || mode == "all" || mode == "trace" {
+	if mode == "cpu" || mode == "trace" {
 		name := "cpu.pprof"
 		if mode == "trace" {
 			name = "execution.trace"
@@ -40,21 +44,19 @@ func StartProfiles(directory, mode string) (func() error, error) {
 			return nil, err
 		}
 	}
-	if mode == "block" || mode == "all" {
-		runtime.SetBlockProfileRate(1)
+	if mode == "block" {
+		runtime.SetBlockProfileRate(int(time.Millisecond))
 	}
 	oldMutex := 0
-	if mode == "mutex" || mode == "all" {
-		oldMutex = runtime.SetMutexProfileFraction(1)
+	if mode == "mutex" {
+		oldMutex = runtime.SetMutexProfileFraction(10)
 	}
 	return func() error {
 		var errs []error
-		// Stop sampling contention before shutting down CPU profiling. This
-		// keeps profiler shutdown itself outside the block/mutex sample window.
-		if mode == "block" || mode == "all" {
+		if mode == "block" {
 			runtime.SetBlockProfileRate(0)
 		}
-		if mode == "mutex" || mode == "all" {
+		if mode == "mutex" {
 			runtime.SetMutexProfileFraction(oldMutex)
 		}
 		if stream != nil {
@@ -67,7 +69,7 @@ func StartProfiles(directory, mode string) (func() error, error) {
 		}
 		// CPU runs also preserve snapshot profiles for convenient investigation.
 		names := []string{mode}
-		if mode == "all" || mode == "cpu" {
+		if mode == "cpu" {
 			names = []string{"heap", "allocs", "goroutine", "block", "mutex"}
 		}
 		for _, name := range names {

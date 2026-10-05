@@ -93,11 +93,12 @@ shell, чтобы они случайно не меняли следующий p
 | `PROFILE` | Только `benchProfile`: `cpu`, `heap`, `allocs`, `goroutine`, `block`, `mutex`, `trace`, `all` |
 | `TIMEOUT` | Watchdog E2E test process (default `6h`); `0s` отключает, короткое значение полезно для диагностики зависаний |
 
-Watchdog ограничивает весь E2E запуск, включая setup и cleanup; это не latency
+Watchdog ограничивает один E2E subprocess, включая setup и cleanup; это не latency
 assertion. При срабатывании Go выводит goroutine stacks и завершает test process,
 освобождая его sockets/listeners. Последний незавершённый сценарий не считается
 успешным. Для runs дольше шести часов увеличьте `TIMEOUT`. Component benchmarks
 имеют собственный стандартный Go lifecycle и не используют этот override.
+При `PROFILE=all` каждый из трёх subprocesses имеет свой watchdog.
 
 Без `FILTER` relay overrides формируют компактный custom scenario. `CLIENTS`
 формирует idle и joined custom scenarios. С `FILTER` overrides применяются к
@@ -216,6 +217,12 @@ scheduled latency и open-loop решают другую часть пробле
 
 Queue utilization периодически sampling `len(events)`, а overflow disconnects
 считаются из существующих server logs. Sampling может пропустить краткие пики.
+При первом overflow log harness сохраняет elapsed measurement time и cumulative
+send/receive counters. `pre_overflow_*_per_second` показывает среднюю скорость
+до первого наблюдённого overflow, исключая оставшееся время после disconnect.
+Это не instantaneous last-bucket rate; send counters считают завершённые Write,
+но их deliveries могут оставаться in flight. Snapshot берётся только при overflow,
+не на normal per-message path.
 Нет дополнительных production counters/hooks или изменения protocol/defaults.
 
 CPU user/system time, utilization (100% = один CPU core), allocations, heap,
@@ -258,12 +265,23 @@ Default profiling workload: 10 channels, fan-out 4, sustained mixed payloads,
 target 5k messages/s. Rate следует подобрать по baseline, чтобы профиль отражал
 типичную production нагрузку и не был профилем перегруженного генератора.
 Overrides применимы. Для trace обычно достаточно 1–3s; trace, block и mutex
-имеют заметную стоимость и запускаются отдельно от baseline. `all` включает
-CPU/block/mutex и snapshots, но не trace.
+имеют заметную стоимость и запускаются отдельно от baseline. `PROFILE=all`
+последовательно запускает CPU, block и mutex в трёх свежих subprocesses с одним
+workload/config. Результаты, binary и profiles находятся соответственно в
+`<run>/cpu/`, `<run>/block/`, `<run>/mutex/`. Measurement duration применяется
+к каждому run: общее время примерно втрое больше плюс setup/warm-up. Trace
+запускается отдельно. CPU и contention samplers не работают одновременно:
+такое сочетание с записью каждого события зависало в локальных Windows runs;
+точная причина внутри runtime не установлена.
 
 Профили стартуют после setup/warm-up. CPU run также сохраняет heap/allocs,
 goroutine и доступные block/mutex snapshots. Для block/mutex sampling включайте
-соответствующий режим. Heap profile не вызывает искусственный GC.
+соответствующий режим. Block sampling использует интервал 1 ms; это sampling
+events пропорционально времени блокировки, а не periodical polling. Mutex
+sampling записывает в среднем одно из десяти contention events. Pprof масштабирует
+sampled values; profiles не являются полным журналом событий. Heap profile не
+вызывает искусственный GC. Прямой вызов harness с `PROFILE=all` отвергается:
+orchestration выполняет Mage, чтобы samplers оставались изолированы.
 
 ```text
 go tool pprof -top perf-results/<run>/relay.test.exe perf-results/<run>/profiles/tcp/1/cpu.pprof

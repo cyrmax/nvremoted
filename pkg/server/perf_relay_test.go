@@ -80,10 +80,17 @@ func runRelayScenario(cfg perf.Config, spec perf.Scenario) (result perf.Result, 
 }
 
 type relayPerfLogHook struct {
-	overflow     atomic.Uint64
-	serverErrors atomic.Uint64
-	disconnects  atomic.Uint64
-	oversized    atomic.Uint64
+	overflow      atomic.Uint64
+	serverErrors  atomic.Uint64
+	disconnects   atomic.Uint64
+	oversized     atomic.Uint64
+	measurement   atomic.Pointer[relayPerfCollector]
+	firstOverflow atomic.Pointer[relayPerfOverflow]
+}
+
+type relayPerfOverflow struct {
+	elapsedNS      int64
+	sent, received uint64
 }
 
 func (h *relayPerfLogHook) Levels() []logrus.Level { return logrus.AllLevels }
@@ -91,7 +98,16 @@ func (h *relayPerfLogHook) Fire(entry *logrus.Entry) error {
 	if entry.Message == "Client disconnected" {
 		h.disconnects.Add(1)
 		if entry.Data["reason"] == "Client event queue overflow" {
-			h.overflow.Add(1)
+			if h.overflow.Add(1) == 1 {
+				if c := h.measurement.Load(); c != nil {
+					c.mu.Lock()
+					elapsed := perf.Since(c.start)
+					if c.measurement && elapsed > 0 {
+						h.firstOverflow.Store(&relayPerfOverflow{elapsedNS: elapsed.Nanoseconds(), sent: c.sentInWindow, received: c.receivedWindow})
+					}
+					c.mu.Unlock()
+				}
+			}
 		}
 		if entry.Data["reason"] == "Incoming message too large" {
 			h.oversized.Add(1)
@@ -786,6 +802,8 @@ func runRelayTraffic(cfg perf.Config, spec perf.Scenario, srv *Server, addr stri
 	collector.end = collector.start.Add(cfg.Duration)
 	collector.measurement = true
 	collector.mu.Unlock()
+	hook.measurement.Store(collector)
+	defer hook.measurement.Store(nil)
 	var sendersDone <-chan struct{}
 	if spec.Kind == "closed" {
 		relayPerfRunClosed(cfg, spec, senders, channelPeers, collector, payloads, &seq)
@@ -908,6 +926,15 @@ func runRelayTraffic(cfg perf.Config, spec perf.Scenario, srv *Server, addr stri
 	result.Observations["client_reader_errors"] = readerErrors
 	result.Observations["drain_complete"] = drainComplete
 	result.Observations["writers_drained"] = writersDrained
+	if overflow := hook.firstOverflow.Load(); overflow != nil {
+		seconds := float64(overflow.elapsedNS) / float64(time.Second)
+		result.Observations["first_queue_overflow_elapsed_ns"] = overflow.elapsedNS
+		result.Observations["sent_before_first_overflow"] = overflow.sent
+		result.Observations["received_before_first_overflow"] = overflow.received
+		result.Observations["pre_overflow_send_messages_per_second"] = float64(overflow.sent) / seconds
+		result.Observations["pre_overflow_receive_deliveries_per_second"] = float64(overflow.received) / seconds
+		result.Observations["pre_overflow_rate_semantics"] = "cumulative measurement-window counters through first observed queue-overflow log, divided by elapsed measurement time; completed sender writes may still have deliveries in flight; not an instantaneous last-bucket rate"
+	}
 	result.Valid = result.Missing == 0 && result.Duplicates == 0 && result.OutOfOrder == 0 && result.Corrupted == 0 && result.Unexpected == 0 && result.Disconnects == 0 && result.ServerErrors == 0 && result.TimestampLost == 0 && writeFailures == 0
 	result.Valid = result.Valid && drainComplete && writersDrained && readerErrors == 0 && result.Sent > 0 && result.Expected == result.Received && result.Latency.Count == result.Received
 	result.Valid = result.Valid && result.Expected == result.Sent*uint64(spec.Fanout)
